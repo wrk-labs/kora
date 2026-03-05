@@ -7,6 +7,8 @@ struct kora_config {
 	char *code_model;
 	char *system_chat;
 	char *system_code;
+	char *compact_chat;
+	char *compact_code;
 	int ctx_size;
 	int threads;
 	int gpu_layers;        /* -2 = auto, -1 = all, 0 = cpu, N = fixed */

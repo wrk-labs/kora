@@ -47,12 +47,19 @@ struct kora_config *kora_config_load(const char *luadir)
 		return cfg;
 	luaL_openlibs(L);
 
-	/* load system prompts from luadir/core/system.lua */
+	/* load system prompts: try installed path, then local ./lua/ */
 	char syspath[512];
 	snprintf(syspath, sizeof(syspath), "%s/core/system.lua", luadir);
-	if (luaL_dofile(L, syspath) == LUA_OK) {
+	if (luaL_dofile(L, syspath) != LUA_OK) {
+		lua_pop(L, 1);
+		snprintf(syspath, sizeof(syspath), "lua/core/system.lua");
+		luaL_dofile(L, syspath);
+	}
+	if (lua_istable(L, -1)) {
 		cfg->system_chat = lua_getfield_str(L, -1, "chat");
 		cfg->system_code = lua_getfield_str(L, -1, "code");
+		cfg->compact_chat = lua_getfield_str(L, -1, "compact_chat");
+		cfg->compact_code = lua_getfield_str(L, -1, "compact_code");
 		lua_pop(L, 1);
 	}
 
@@ -80,17 +87,6 @@ struct kora_config *kora_config_load(const char *luadir)
 
 	lua_close(L);
 
-	/* fallback system prompts if lua file missing */
-	if (!cfg->system_chat)
-		cfg->system_chat = strdup(
-			"You are Kora, a helpful AI assistant running locally. "
-			"Be concise and direct in your responses. Use markdown for formatting.");
-	if (!cfg->system_code)
-		cfg->system_code = strdup(
-			"You are Kora, an AI coding assistant running locally. "
-			"Help with writing, debugging, refactoring, and explaining code. "
-			"Be concise. Use markdown code blocks. Follow existing code conventions.");
-
 	return cfg;
 }
 
@@ -103,5 +99,7 @@ void kora_config_free(struct kora_config *cfg)
 	free(cfg->code_model);
 	free(cfg->system_chat);
 	free(cfg->system_code);
+	free(cfg->compact_chat);
+	free(cfg->compact_code);
 	free(cfg);
 }

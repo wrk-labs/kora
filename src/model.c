@@ -59,7 +59,7 @@ int model_list(void)
 	DIR *d = opendir(dir);
 	if (!d) {
 		free(dir);
-		printf("no models downloaded\n");
+		printf("No models downloaded.\n");
 		return 0;
 	}
 
@@ -92,7 +92,7 @@ int model_list(void)
 	free(dir);
 
 	if (count == 0)
-		printf("no models downloaded\n");
+		printf("No models downloaded.\n");
 
 	return 0;
 }
@@ -129,6 +129,11 @@ int model_rm(const char *name)
 	printf("removed %s\n", filename);
 	free(path);
 	return 0;
+}
+
+int model_exists(const char *model_path)
+{
+	return access(model_path, F_OK) == 0;
 }
 
 int model_pull(const char *target)

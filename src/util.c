@@ -49,3 +49,43 @@ int kora_init_dirs(void)
 	}
 	return 0;
 }
+
+char *kora_preferred_model(void)
+{
+	char *path = kora_path("preferred_model");
+	if (!path)
+		return NULL;
+
+	FILE *f = fopen(path, "r");
+	free(path);
+	if (!f)
+		return NULL;
+
+	char buf[256];
+	if (!fgets(buf, sizeof(buf), f)) {
+		fclose(f);
+		return NULL;
+	}
+	fclose(f);
+
+	buf[strcspn(buf, "\n")] = 0;
+	if (buf[0] == '\0')
+		return NULL;
+
+	return strdup(buf);
+}
+
+void kora_set_preferred_model(const char *name)
+{
+	char *path = kora_path("preferred_model");
+	if (!path)
+		return;
+
+	FILE *f = fopen(path, "w");
+	free(path);
+	if (!f)
+		return;
+
+	fprintf(f, "%s\n", name);
+	fclose(f);
+}

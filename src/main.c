@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "input.h"
 #include "inference.h"
 #include "lua_bridge.h"
 #include "model.h"
@@ -10,16 +11,16 @@
 
 static void usage(void)
 {
-	printf("usage: kora <command> [args]\n"
+	printf("Usage: kora <command> [args]\n"
 	       "\n"
-	       "commands:\n"
-	       "  chat            interactive chat\n"
-	       "  code            agentic coding assistant\n"
-	       "  pull <model>    download a model\n"
-	       "  list            list downloaded models\n"
-	       "  rm <model>      remove a model\n"
-	       "  sessions        list sessions\n"
-	       "  version         print version\n");
+	       "Commands:\n"
+	       "  chat            Interactive chat\n"
+	       "  code            Agentic coding assistant\n"
+	       "  pull <model>    Download a model\n"
+	       "  list            List downloaded models\n"
+	       "  rm <model>      Remove a model\n"
+	       "  sessions        List sessions\n"
+	       "  version         Print version\n");
 }
 
 static void version(void)
@@ -37,6 +38,12 @@ static char *resolve_model_path(const char *model_name)
 		filename = slash ? slash + 1 : url;
 	} else {
 		filename = model_name;
+	}
+
+	/* reject path traversal */
+	if (strstr(filename, "..") || strchr(filename, '/')) {
+		fprintf(stderr, "kora: invalid model name '%s'\n", model_name);
+		return NULL;
 	}
 
 	char sub[512];
@@ -68,7 +75,7 @@ int main(int argc, char *argv[])
 
 	if (strcmp(argv[1], "pull") == 0) {
 		if (argc < 3) {
-			fprintf(stderr, "usage: kora pull <model|url>\n");
+			fprintf(stderr, "Usage: kora pull <model|url>\n");
 			return 1;
 		}
 		return model_pull(argv[2]);
@@ -80,7 +87,7 @@ int main(int argc, char *argv[])
 
 	if (strcmp(argv[1], "rm") == 0) {
 		if (argc < 3) {
-			fprintf(stderr, "usage: kora rm <model>\n");
+			fprintf(stderr, "Usage: kora rm <model>\n");
 			return 1;
 		}
 		return model_rm(argv[2]);
@@ -90,24 +97,70 @@ int main(int argc, char *argv[])
 		/* load config */
 		struct kora_config *cfg = kora_config_load(LUADIR);
 
-		/* resolve model: -m flag > chat_model > default_model */
-		const char *model_name = cfg->chat_model ? cfg->chat_model : cfg->default_model;
+		/* resolve model: arg > -m flag > preferred_model */
+		const char *model_name = NULL;
+		char *preferred = NULL;
 		int i;
+
+		/* kora chat <model> */
+		if (argc >= 3 && argv[2][0] != '-')
+			model_name = argv[2];
+
+		/* kora chat -m <model> */
 		for (i = 2; i < argc - 1; i++) {
 			if (strcmp(argv[i], "-m") == 0)
 				model_name = argv[i + 1];
 		}
 
-		char *model_path = resolve_model_path(model_name);
-		if (!model_path) {
+		/* fallback to preferred model */
+		if (!model_name) {
+			preferred = kora_preferred_model();
+			if (preferred)
+				model_name = preferred;
+		}
+
+		/* no model specified and no preferred model */
+		if (!model_name) {
+			printf("No model selected.\n\n");
+			printf("Downloaded models:\n");
+			model_list();
+			printf("\nUsage: kora chat <model>\n");
+			printf("To download a model: kora pull <model>\n");
+			free(preferred);
 			kora_config_free(cfg);
 			return 1;
 		}
 
-		kora_suppress_logs();
-		printf("loading %s...\n", model_name);
+		char *model_path = resolve_model_path(model_name);
+		if (!model_path) {
+			free(preferred);
+			kora_config_free(cfg);
+			return 1;
+		}
 
-		struct kora_ctx *kc = kora_load(model_path, cfg->ctx_size, cfg->gpu_layers);
+		/* check model file exists */
+		if (!model_exists(model_path)) {
+			fprintf(stderr, "Model '%s' not found.\n\n", model_name);
+			printf("Downloaded models:\n");
+			model_list();
+			printf("\nTo download: kora pull %s\n", model_name);
+			free(model_path);
+			free(preferred);
+			kora_config_free(cfg);
+			return 1;
+		}
+
+		/* save as preferred model and keep a stable copy of the name */
+		kora_set_preferred_model(model_name);
+		char *current_model = strdup(model_name);
+		free(preferred);
+		preferred = NULL;
+		model_name = current_model;
+
+		kora_suppress_logs();
+		printf("Loading %s...\n", model_name);
+
+		struct kora_ctx *kc = kora_load(model_path, cfg->ctx_size, cfg->gpu_layers, cfg->threads);
 		free(model_path);
 		if (!kc) {
 			kora_config_free(cfg);
@@ -122,76 +175,213 @@ int main(int argc, char *argv[])
 		int n_msg = 0;
 		int n_hist = 0;
 
-		roles[0] = "system";
-		contents[0] = cfg->system_chat;
-		n_msg = 1;
+		if (cfg->system_chat) {
+			roles[0] = "system";
+			contents[0] = cfg->system_chat;
+			n_msg = 1;
+		} else {
+			n_msg = 0;
+		}
 
-		char input[4096];
-		printf("kora chat (%s) — type 'exit' to quit\n\n", model_name);
-		while (1) {
-			printf("> ");
-			fflush(stdout);
-			if (!fgets(input, sizeof(input), stdin))
+		input_init();
+		kora_status(kc, model_name, 0, 0);
+		printf("Type /help for commands.\n\n");
+		int running = 1;
+		while (running) {
+			char *input = input_read("> ");
+			if (!input)
 				break;
-			input[strcspn(input, "\n")] = 0;
-			if (strcmp(input, "exit") == 0 || strcmp(input, "quit") == 0)
-				break;
-			if (input[0] == '\0')
-				continue;
-
-			if (n_msg >= 1 + MAX_TURNS * 2 - 1) {
-				fprintf(stderr, "kora: conversation too long, start a new session\n");
-				break;
-			}
-
-			/* add user message */
-			history_bufs[n_hist] = strdup(input);
-			roles[n_msg] = "user";
-			contents[n_msg] = history_bufs[n_hist];
-			n_msg++;
-			n_hist++;
-
-			/* apply template with full conversation */
-			char *prompt = kora_apply_template(kc, roles, contents, n_msg);
-			if (!prompt) {
-				fprintf(stderr, "kora: failed to apply chat template\n");
-				n_msg--;
-				n_hist--;
-				free(history_bufs[--n_hist]);
+			if (input[0] == '\0') {
+				free(input);
 				continue;
 			}
 
-			/* regenerate from full history */
-			kora_clear(kc);
-			char *response = NULL;
-			kora_generate(kc, prompt, &response);
-			free(prompt);
+			/* slash commands */
+			if (strcmp(input, "/exit") == 0 || strcmp(input, "exit") == 0 ||
+			    strcmp(input, "/quit") == 0 || strcmp(input, "quit") == 0) {
+				free(input);
+				running = 0;
+			} else if (strcmp(input, "/help") == 0) {
+				printf("\nCommands:\n"
+				       "  /help           Show this message\n"
+				       "  /model <name>   Switch to a different model\n"
+				       "  /status         Show model and context info\n"
+				       "  /compact        Summarize conversation to free context\n"
+				       "  /clear          Clear conversation history\n"
+				       "  /exit           Quit chat\n\n");
+				free(input);
+			} else if (strcmp(input, "/status") == 0) {
+				char *full_prompt = kora_apply_template(kc, roles, contents, n_msg);
+				int used = full_prompt ? kora_token_count(kc, full_prompt) : 0;
+				free(full_prompt);
+				kora_status(kc, model_name, n_msg - 1, used);
+				free(input);
+			} else if (strcmp(input, "/clear") == 0) {
+				for (i = 0; i < n_hist; i++)
+					free(history_bufs[i]);
+				n_msg = 1;
+				n_hist = 0;
+				kora_clear(kc);
+				printf("Conversation cleared.\n");
+				free(input);
+			} else if (strcmp(input, "/compact") == 0) {
+				if (n_msg <= 1) {
+					printf("Nothing to compact.\n");
+				} else {
+					char *full_prompt = kora_apply_template(kc, roles, contents, n_msg);
+					if (full_prompt) {
+						int before = kora_token_count(kc, full_prompt);
+						printf("Compacting context (%d tokens)...\n", before);
+						char *summary = kora_summarize(kc, full_prompt, cfg->compact_chat);
+						free(full_prompt);
 
-			/* add assistant response */
-			if (response) {
-				history_bufs[n_hist] = response;
-				roles[n_msg] = "assistant";
+						if (summary) {
+							for (i = 0; i < n_hist; i++)
+								free(history_bufs[i]);
+							n_hist = 0;
+							n_msg = 1;
+
+							history_bufs[n_hist] = summary;
+							roles[n_msg] = "assistant";
+							contents[n_msg] = history_bufs[n_hist];
+							n_msg++;
+							n_hist++;
+
+							char *after_prompt = kora_apply_template(kc, roles, contents, n_msg);
+							int after = after_prompt ? kora_token_count(kc, after_prompt) : 0;
+							free(after_prompt);
+							printf("Compacted: %d → %d tokens\n", before, after);
+						} else {
+							fprintf(stderr, "kora: compaction failed\n");
+						}
+					}
+				}
+				free(input);
+			} else if (strncmp(input, "/model", 6) == 0) {
+				const char *new_name = input + 6;
+				while (*new_name == ' ')
+					new_name++;
+				if (*new_name == '\0') {
+					printf("Current model: %s\n", model_name);
+					printf("Usage: /model <name>\n");
+				} else {
+					char *new_path = resolve_model_path(new_name);
+					if (!new_path) {
+						fprintf(stderr, "kora: could not resolve model '%s'\n", new_name);
+					} else {
+						printf("Loading %s...\n", new_name);
+						struct kora_ctx *new_kc = kora_load(new_path, cfg->ctx_size, cfg->gpu_layers, cfg->threads);
+						free(new_path);
+						if (!new_kc) {
+							fprintf(stderr, "kora: failed to load '%s', keeping current model\n", new_name);
+						} else {
+							kora_free(kc);
+							kc = new_kc;
+							free(current_model);
+							current_model = strdup(new_name);
+							model_name = current_model;
+							kora_set_preferred_model(model_name);
+							printf("Switched to %s\n\n", model_name);
+						}
+					}
+				}
+				free(input);
+			} else if (input[0] == '/') {
+				fprintf(stderr, "Unknown command: %s (type /help)\n", input);
+				free(input);
+			} else if (n_msg >= 1 + MAX_TURNS * 2 - 1) {
+				fprintf(stderr, "kora: conversation too long, use /clear or /exit\n");
+				free(input);
+				running = 0;
+			} else {
+				/* add user message */
+				history_bufs[n_hist] = strdup(input);
+				roles[n_msg] = "user";
 				contents[n_msg] = history_bufs[n_hist];
 				n_msg++;
 				n_hist++;
+
+				/* apply template with full conversation */
+				char *prompt = kora_apply_template(kc, roles, contents, n_msg);
+				if (!prompt) {
+					fprintf(stderr, "kora: failed to apply chat template\n");
+					n_msg--;
+					n_hist--;
+					free(history_bufs[--n_hist]);
+					free(input);
+					continue;
+				}
+
+				/* compress context if approaching the limit */
+				int prompt_tokens = kora_token_count(kc, prompt);
+				if (kora_context_needs_compression(kc, prompt_tokens)) {
+					printf("[Compressing context...]\n");
+					char *summary = kora_summarize(kc, prompt, cfg->compact_chat);
+					free(prompt);
+
+					if (summary) {
+						for (i = 0; i < n_hist; i++)
+							free(history_bufs[i]);
+
+						char *user_msg = strdup(input);
+						n_hist = 0;
+						n_msg = 1;
+
+						history_bufs[n_hist] = summary;
+						roles[n_msg] = "assistant";
+						contents[n_msg] = history_bufs[n_hist];
+						n_msg++;
+						n_hist++;
+
+						history_bufs[n_hist] = user_msg;
+						roles[n_msg] = "user";
+						contents[n_msg] = history_bufs[n_hist];
+						n_msg++;
+						n_hist++;
+					}
+
+					prompt = kora_apply_template(kc, roles, contents, n_msg);
+					if (!prompt) {
+						fprintf(stderr, "kora: failed to apply template after compression\n");
+						free(input);
+						continue;
+					}
+				}
+
+				/* regenerate from full history */
+				kora_clear(kc);
+				char *response = NULL;
+				kora_generate(kc, prompt, &response);
+				free(prompt);
+
+				if (response) {
+					history_bufs[n_hist] = response;
+					roles[n_msg] = "assistant";
+					contents[n_msg] = history_bufs[n_hist];
+					n_msg++;
+					n_hist++;
+				}
+				printf("\n");
+				free(input);
 			}
-			printf("\n");
 		}
 
 		for (i = 0; i < n_hist; i++)
 			free(history_bufs[i]);
+		input_cleanup();
+		free(current_model);
 		kora_free(kc);
 		kora_config_free(cfg);
 		return 0;
 	}
 
 	if (strcmp(argv[1], "code") == 0) {
-		printf("code: not yet implemented\n");
+		printf("Code: not yet implemented\n");
 		return 1;
 	}
 
 	if (strcmp(argv[1], "sessions") == 0) {
-		printf("sessions: not yet implemented\n");
+		printf("Sessions: not yet implemented\n");
 		return 1;
 	}
 

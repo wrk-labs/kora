@@ -11,4 +11,8 @@ Rules:
 - When editing code, show only the changed parts.
 - When running commands, briefly explain what they do.
 - Refuse to write or explain malicious code.]],
+
+    compact_chat = [[Produce a detailed but concise summary of the conversation below. Focus on information needed to continue the conversation: what was discussed, what was decided, which topics were involved, and what is still open or planned next. Do not include greetings or filler.]],
+
+    compact_code = [[Produce a detailed but concise summary of the conversation below. Focus on information needed to continue the coding session: what was built, what was changed, which files were modified, what bugs were found or fixed, and what tasks remain. Include specific file paths, function names, and technical decisions.]],
 }
