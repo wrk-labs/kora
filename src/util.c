@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "util.h"
 
@@ -32,6 +33,24 @@ char *kora_path(const char *sub)
 	return path;
 }
 
+static void copy_file(const char *src, const char *dst)
+{
+	FILE *in = fopen(src, "r");
+	if (!in)
+		return;
+	FILE *out = fopen(dst, "w");
+	if (!out) {
+		fclose(in);
+		return;
+	}
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
+		fwrite(buf, 1, n, out);
+	fclose(in);
+	fclose(out);
+}
+
 int kora_init_dirs(void)
 {
 	char *dirs[] = { "", "models", "sessions", "plugins" };
@@ -47,6 +66,20 @@ int kora_init_dirs(void)
 		}
 		free(path);
 	}
+
+	/* copy default config.lua if not present */
+	char *cfg_dst = kora_path("config.lua");
+	if (cfg_dst) {
+		if (access(cfg_dst, F_OK) != 0) {
+			char src[512];
+			snprintf(src, sizeof(src), "%s/core/config.lua", LUADIR);
+			if (access(src, F_OK) != 0)
+				snprintf(src, sizeof(src), "lua/core/config.lua");
+			copy_file(src, cfg_dst);
+		}
+		free(cfg_dst);
+	}
+
 	return 0;
 }
 
