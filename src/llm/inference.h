@@ -26,10 +26,26 @@ char *kora_apply_template(struct kora_ctx *kc,
                           const char **roles, const char **contents,
                           int n_msg);
 
-/* generate a response from a formatted prompt, streaming to stdout
+/* token streaming callback: called for each generated token piece
+   text is the decoded token text, len is its byte length
+   user_data is the opaque pointer passed to kora_generate */
+typedef void (*kora_stream_cb)(const char *text, int len, void *user_data);
+
+/* set the streaming callback for token output
+   if NULL, tokens are printed to stdout (default behavior) */
+void kora_set_stream_cb(kora_stream_cb cb, void *user_data);
+
+/* generate a response from a formatted prompt
+   streams tokens via the callback (or stdout if no callback set)
    if out is not NULL, the full response text is stored there (caller must free)
    returns number of tokens generated, or -1 on error */
 int kora_generate(struct kora_ctx *kc, const char *prompt, char **out);
+
+/* signal the generation loop to stop (thread-safe) */
+void kora_abort(void);
+
+/* reset the abort flag */
+void kora_abort_reset(void);
 
 /* clear the context (KV cache) for a new conversation */
 void kora_clear(struct kora_ctx *kc);

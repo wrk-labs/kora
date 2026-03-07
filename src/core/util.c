@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,4 +122,29 @@ void kora_set_preferred_model(const char *name)
 
 	fprintf(f, "%s\n", name);
 	fclose(f);
+}
+
+int kora_stderr_suppress(void)
+{
+	int saved = dup(STDERR_FILENO);
+	if (saved < 0)
+		return -1;
+
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull < 0) {
+		close(saved);
+		return -1;
+	}
+
+	dup2(devnull, STDERR_FILENO);
+	close(devnull);
+	return saved;
+}
+
+void kora_stderr_restore(int saved_fd)
+{
+	if (saved_fd < 0)
+		return;
+	dup2(saved_fd, STDERR_FILENO);
+	close(saved_fd);
 }

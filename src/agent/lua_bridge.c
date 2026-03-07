@@ -9,6 +9,7 @@
 #include "lua_bridge.h"
 #include "util.h"
 
+
 static char *lua_getfield_str(lua_State *L, int idx, const char *key)
 {
 	lua_getfield(L, idx, key);
@@ -53,7 +54,7 @@ struct kora_config *kora_config_load(const char *luadir)
 	if (luaL_dofile(L, syspath) != LUA_OK) {
 		lua_pop(L, 1);
 		snprintf(syspath, sizeof(syspath), "lua/core/system.lua");
-		luaL_dofile(L, syspath);
+		(void)luaL_dofile(L, syspath);
 	}
 	if (lua_istable(L, -1)) {
 		cfg->system_chat = lua_getfield_str(L, -1, "chat");

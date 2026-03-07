@@ -274,6 +274,29 @@ char *kora_summarize(struct kora_ctx *kc, const char *conversation, const char *
 	return summary;
 }
 
+/* abort flag */
+static volatile int abort_flag = 0;
+
+void kora_abort(void)
+{
+	abort_flag = 1;
+}
+
+void kora_abort_reset(void)
+{
+	abort_flag = 0;
+}
+
+/* streaming callback */
+static kora_stream_cb stream_cb = NULL;
+static void *stream_cb_data = NULL;
+
+void kora_set_stream_cb(kora_stream_cb cb, void *user_data)
+{
+	stream_cb = cb;
+	stream_cb_data = user_data;
+}
+
 int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 {
 	const struct llama_vocab *vocab = llama_model_get_vocab(kc->model);
@@ -322,6 +345,9 @@ int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 	char piece[128];
 
 	while (n_gen < n_max) {
+		if (abort_flag)
+			break;
+
 		llama_token id = llama_sampler_sample(kc->sampler, kc->ctx, -1);
 
 		if (llama_vocab_is_eog(vocab, id))
@@ -329,8 +355,13 @@ int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 
 		int len = llama_token_to_piece(vocab, id, piece, sizeof(piece), 0, true);
 		if (len > 0) {
-			fwrite(piece, 1, len, stdout);
-			fflush(stdout);
+			/* stream via callback or stdout */
+			if (stream_cb) {
+				stream_cb(piece, len, stream_cb_data);
+			} else {
+				fwrite(piece, 1, len, stdout);
+				fflush(stdout);
+			}
 
 			/* accumulate output */
 			if (out_buf) {
@@ -356,7 +387,8 @@ int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 		n_gen++;
 	}
 
-	printf("\n");
+	if (!stream_cb)
+		printf("\n");
 	if (out)
 		*out = out_buf;
 	return n_gen;

@@ -24,6 +24,15 @@ static int has_suffix(const char *str, const char *suffix)
 	return strcmp(str + slen - xlen, suffix) == 0;
 }
 
+static model_progress_cb ext_progress_cb = NULL;
+static void *ext_progress_data = NULL;
+
+void model_set_progress_cb(model_progress_cb cb, void *user_data)
+{
+	ext_progress_cb = cb;
+	ext_progress_data = user_data;
+}
+
 struct progress_data {
 	const char *filename;
 	int last_pct;
@@ -44,8 +53,13 @@ static int progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
 		pd->last_pct = pct;
 		double dl_mb = (double)dlnow / (1024.0 * 1024.0);
 		double total_mb = (double)dltotal / (1024.0 * 1024.0);
-		printf("\r  %s: %.0fMB / %.0fMB (%d%%)", pd->filename, dl_mb, total_mb, pct);
-		fflush(stdout);
+
+		if (ext_progress_cb) {
+			ext_progress_cb(pct, dl_mb, total_mb, ext_progress_data);
+		} else {
+			printf("\r  %s: %.0fMB / %.0fMB (%d%%)", pd->filename, dl_mb, total_mb, pct);
+			fflush(stdout);
+		}
 	}
 	return 0;
 }
@@ -141,17 +155,21 @@ int model_pull(const char *target)
 	const char *url;
 	const char *alias = NULL;
 
+	int tui_mode = (ext_progress_cb != NULL);
+
 	/* if it looks like a URL, use directly */
 	if (strncmp(target, "http://", 7) == 0 || strncmp(target, "https://", 8) == 0) {
 		url = target;
 	} else {
 		url = registry_lookup(target);
 		if (!url) {
-			fprintf(stderr, "kora: unknown model '%s'\n\navailable models:\n", target);
-			int i;
-			for (i = 0; registry[i].alias; i++)
-				fprintf(stderr, "  %-20s %s  %s\n", registry[i].alias, registry[i].size, registry[i].quant);
-			fprintf(stderr, "\nor provide a direct URL: kora pull https://...\n");
+			if (!tui_mode) {
+				fprintf(stderr, "kora: unknown model '%s'\n\navailable models:\n", target);
+				int i;
+				for (i = 0; registry[i].alias; i++)
+					fprintf(stderr, "  %-20s %s  %s\n", registry[i].alias, registry[i].size, registry[i].quant);
+				fprintf(stderr, "\nor provide a direct URL: kora pull https://...\n");
+			}
 			return -1;
 		}
 		alias = target;
@@ -167,7 +185,8 @@ int model_pull(const char *target)
 
 	/* check if already downloaded */
 	if (access(dest, F_OK) == 0) {
-		printf("model '%s' already downloaded\n", alias ? alias : filename);
+		if (!tui_mode)
+			printf("model '%s' already downloaded\n", alias ? alias : filename);
 		free(dest);
 		return 0;
 	}
@@ -176,18 +195,21 @@ int model_pull(const char *target)
 	char tmp[512];
 	snprintf(tmp, sizeof(tmp), "%s.part", dest);
 
-	printf("pulling %s\n", alias ? alias : filename);
+	if (!tui_mode)
+		printf("pulling %s\n", alias ? alias : filename);
 
 	CURL *curl = curl_easy_init();
 	if (!curl) {
-		fprintf(stderr, "kora: failed to initialize curl\n");
+		if (!tui_mode)
+			fprintf(stderr, "kora: failed to initialize curl\n");
 		free(dest);
 		return -1;
 	}
 
 	FILE *fp = fopen(tmp, "wb");
 	if (!fp) {
-		fprintf(stderr, "kora: failed to open '%s' for writing\n", tmp);
+		if (!tui_mode)
+			fprintf(stderr, "kora: failed to open '%s' for writing\n", tmp);
 		curl_easy_cleanup(curl);
 		free(dest);
 		return -1;
@@ -208,7 +230,8 @@ int model_pull(const char *target)
 	curl_easy_cleanup(curl);
 
 	if (res != CURLE_OK) {
-		fprintf(stderr, "\nkora: download failed: %s\n", curl_easy_strerror(res));
+		if (!tui_mode)
+			fprintf(stderr, "\nkora: download failed: %s\n", curl_easy_strerror(res));
 		unlink(tmp);
 		free(dest);
 		return -1;
@@ -216,13 +239,15 @@ int model_pull(const char *target)
 
 	/* move temp file to final destination */
 	if (rename(tmp, dest) != 0) {
-		fprintf(stderr, "\nkora: failed to save model\n");
+		if (!tui_mode)
+			fprintf(stderr, "\nkora: failed to save model\n");
 		unlink(tmp);
 		free(dest);
 		return -1;
 	}
 
-	printf("\ndone\n");
+	if (!tui_mode)
+		printf("\ndone\n");
 	free(dest);
 	return 0;
 }
