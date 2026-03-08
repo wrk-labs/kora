@@ -159,6 +159,8 @@ void kora_free(struct kora_ctx *kc)
 
 void kora_clear(struct kora_ctx *kc)
 {
+	if (!kc || !kc->ctx)
+		return;
 	llama_memory_clear(llama_get_memory(kc->ctx), true);
 }
 

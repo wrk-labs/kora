@@ -257,7 +257,8 @@ static const char *default_statusbar = "/help";
 
 /* command table for dynamic statusbar hints */
 static const char *slash_commands[] = {
-	"/help", "/model", "/pull", "/compact", "/clear", "/exit", "/quit", NULL
+	"/help", "/model", "/pull", "/compact", "/clear",
+	"/resume", "/exit", "/quit", NULL
 };
 
 static void update_dynamic_statusbar(void)

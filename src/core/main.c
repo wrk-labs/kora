@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <pthread.h>
 
 #include "db.h"
@@ -217,6 +218,113 @@ static void *switch_thread_fn(void *arg)
 	return NULL;
 }
 
+/* --- background session naming --- */
+
+static volatile int naming_session = 0;
+static char *session_name_result = NULL;
+static int naming_session_id = -1;
+
+struct naming_args {
+	struct kora_ctx *kc;
+	char *conversation;
+	int session_id;
+};
+
+static void *naming_thread_fn(void *arg)
+{
+	struct naming_args *na = arg;
+
+	tui_statusbar("naming session...");
+	kora_set_stream_cb(null_stream_cb, NULL);
+	kora_abort_reset();
+
+	const char *roles[2] = { "system", "user" };
+	const char *contents[2] = {
+		"Generate a short title (3-5 words) for this conversation. "
+		"Reply with ONLY the title, no quotes, no punctuation at the end.",
+		na->conversation
+	};
+
+	char *prompt = kora_apply_template(na->kc, roles, contents, 2);
+	if (prompt) {
+		kora_clear(na->kc);
+		char *name = NULL;
+		int ret = kora_generate(na->kc, prompt, &name);
+		free(prompt);
+
+		if (ret > 0 && name && name[0] != '\0') {
+			/* trim whitespace and newlines */
+			char *end = name + strlen(name) - 1;
+			while (end > name && (*end == '\n' || *end == '\r' || *end == ' '))
+				*end-- = '\0';
+
+			/* truncate to 120 chars */
+			if (strlen(name) > 120)
+				name[120] = '\0';
+
+			session_name_result = name;
+			naming_session_id = na->session_id;
+		} else {
+			free(name);
+		}
+	}
+
+	kora_set_stream_cb(tui_stream_cb, NULL);
+	tui_statusbar(NULL);
+	free(na->conversation);
+	free(na);
+	naming_session = 0;
+	return NULL;
+}
+
+/* validate that a string is a positive integer, returns the value or -1 */
+static int parse_positive_int(const char *s)
+{
+	if (!s || !*s)
+		return -1;
+	const char *p = s;
+	while (*p) {
+		if (*p < '0' || *p > '9')
+			return -1;
+		p++;
+	}
+	int val = atoi(s);
+	return val > 0 ? val : -1;
+}
+
+/* validate a model name or alias: alphanumeric, hyphens, dots, underscores */
+static int valid_model_name(const char *name)
+{
+	if (!name || !*name)
+		return 0;
+	if (strlen(name) > 128)
+		return 0;
+	const char *p = name;
+	while (*p) {
+		if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+		    (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
+		    *p == '.')
+			p++;
+		else
+			return 0;
+	}
+	return 1;
+}
+
+/* validate a pull target: model name or URL */
+static int valid_pull_target(const char *target)
+{
+	if (!target || !*target)
+		return 0;
+	if (strlen(target) > 512)
+		return 0;
+	/* URLs are fine — libcurl handles them safely */
+	if (strncmp(target, "http://", 7) == 0 || strncmp(target, "https://", 8) == 0)
+		return 1;
+	/* otherwise must be a valid model name */
+	return valid_model_name(target);
+}
+
 static void update_context_status(struct kora_ctx *kc, const char **roles,
                                   const char **contents, int n_msg)
 {
@@ -373,6 +481,12 @@ int main(int argc, char *argv[])
 		free(preferred);
 		preferred = NULL;
 
+		/* session tracking */
+		int session_id = -1;
+		int msg_seq = 0;
+		int user_msg_count = 0;
+		int session_named = 0;
+
 		/* conversation history */
 		#define MAX_TURNS 128
 		const char *roles[1 + MAX_TURNS * 2];
@@ -392,6 +506,12 @@ int main(int argc, char *argv[])
 		update_context_status(kc, roles, contents, n_msg);
 		int running = 1;
 		while (running) {
+			char *input = tui_input("> ");
+
+			/* collect completed background tasks — must run after
+			   tui_input returns so results that arrive while the
+			   user was typing are picked up before processing input */
+
 			/* collect completed generation */
 			if (!generating && gen_response) {
 				history_bufs[n_hist] = gen_response;
@@ -399,8 +519,42 @@ int main(int argc, char *argv[])
 				contents[n_msg] = history_bufs[n_hist];
 				n_msg++;
 				n_hist++;
+
+				/* save assistant message to session */
+				if (session_id >= 0) {
+					db_message_add(session_id, msg_seq++,
+						"assistant", gen_response, 1);
+				}
+
 				gen_response = NULL;
 				update_context_status(kc, roles, contents, n_msg);
+
+				/* auto-name session after 10 user messages.
+				   triggered here (after generation completes) so
+				   the naming thread doesn't compete with generation
+				   for the inference context */
+				if (user_msg_count >= 10 && !session_named &&
+				    !naming_session && session_id >= 0 && kc) {
+					char *conv_buf = malloc(8192);
+					if (conv_buf) {
+						int cpos = 0;
+						int j;
+						for (j = cfg->system_chat ? 1 : 0; j < n_msg && cpos < 7000; j++) {
+							int len = snprintf(conv_buf + cpos, 8192 - cpos,
+								"%s: %s\n", roles[j], contents[j]);
+							if (len > 0) cpos += len;
+						}
+
+						struct naming_args *na = malloc(sizeof(*na));
+						pthread_t naming_tid;
+						na->kc = kc;
+						na->conversation = conv_buf;
+						na->session_id = session_id;
+						naming_session = 1;
+						pthread_create(&naming_tid, NULL, naming_thread_fn, na);
+						pthread_detach(naming_tid);
+					}
+				}
 			}
 
 			/* collect completed compact */
@@ -449,7 +603,13 @@ int main(int argc, char *argv[])
 				update_context_status(kc, roles, contents, n_msg);
 			}
 
-			char *input = tui_input("> ");
+			/* collect completed session naming */
+			if (!naming_session && session_name_result) {
+				db_session_set_name(naming_session_id, session_name_result);
+				session_named = 1;
+				free(session_name_result);
+				session_name_result = NULL;
+			}
 			if (!input)
 				break;
 			if (input[0] == '\0') {
@@ -488,7 +648,150 @@ int main(int argc, char *argv[])
 				tui_info("/pull <name>    Download a model");
 				tui_info("/compact        Summarize conversation to free context");
 				tui_info("/clear          Clear conversation history");
+				tui_info("/resume         Resume or manage previous sessions");
 				tui_info("/exit           Quit chat");
+				free(input);
+			} else if (strncmp(input, "/resume", 7) == 0) {
+				if (generating || compacting || switching_model || naming_session) {
+					tui_info("Busy. Press ESC to cancel current task first.");
+				} else {
+					const char *arg = input + 7;
+					while (*arg == ' ') arg++;
+
+					struct db_session sessions[20];
+					int ns = db_sessions_list(sessions, 20);
+
+					if (strncmp(arg, "rm ", 3) == 0) {
+						/* /resume rm <#> — delete a session by list number */
+						int del = parse_positive_int(arg + 3);
+						if (del < 1 || del > ns) {
+							tui_info("Invalid session number. Use /resume to see the list.");
+						} else {
+							int del_id = sessions[del - 1].id;
+							if (del_id == session_id) {
+								session_id = -1;
+								msg_seq = 0;
+								user_msg_count = 0;
+								session_named = 0;
+							}
+							db_session_delete(del_id);
+							tui_info("Session deleted.");
+						}
+					} else if (ns == 0) {
+						tui_info("No previous sessions.");
+					} else if (*arg == '\0') {
+						/* bare /resume — show the list */
+						tui_info("");
+						tui_info("  #  Name                      Date           Msgs  Last message");
+						tui_info("  ──────────────────────────────────────────────────────────────────");
+						for (i = 0; i < ns; i++) {
+							char line[512];
+							char name_trunc[25];
+							snprintf(name_trunc, sizeof(name_trunc), "%s", sessions[i].name);
+
+							/* shorten date: "2026-03-08 14:23:45" -> "Mar 08 14:23" */
+							char date_short[16];
+							const char *months[] = {
+								"Jan","Feb","Mar","Apr","May","Jun",
+								"Jul","Aug","Sep","Oct","Nov","Dec"
+							};
+							int yr, mo, dy, hh, mm;
+							if (sscanf(sessions[i].updated_at, "%d-%d-%d %d:%d",
+								   &yr, &mo, &dy, &hh, &mm) == 5 && mo >= 1 && mo <= 12) {
+								snprintf(date_short, sizeof(date_short),
+									"%s %02d %02d:%02d", months[mo-1], dy, hh, mm);
+							} else {
+								snprintf(date_short, sizeof(date_short), "%.15s",
+									sessions[i].updated_at);
+							}
+
+							char msg_trunc[31];
+							snprintf(msg_trunc, sizeof(msg_trunc), "%s", sessions[i].last_message);
+							char *nl;
+							while ((nl = strchr(msg_trunc, '\n')) != NULL) *nl = ' ';
+
+							snprintf(line, sizeof(line), "  %-2d %-25s %-14s %4d  %s%s",
+								i + 1, name_trunc,
+								date_short,
+								sessions[i].message_count,
+								msg_trunc,
+								strlen(sessions[i].last_message) > 30 ? "..." : "");
+							tui_info(line);
+						}
+						tui_info("");
+						tui_info("  /resume <#>       Resume a session");
+						tui_info("  /resume rm <#>    Delete a session");
+						tui_info("");
+					} else {
+						/* /resume <n> — select a session */
+						int sel = parse_positive_int(arg);
+						if (sel < 1 || sel > ns) {
+							tui_info("Invalid session number. Use /resume to see the list.");
+						} else {
+							int idx = sel - 1;
+							int sid = sessions[idx].id;
+
+							/* clear current conversation */
+							for (i = 0; i < n_hist; i++)
+								free(history_bufs[i]);
+							n_hist = 0;
+							n_msg = cfg->system_chat ? 1 : 0;
+							if (kc) kora_clear(kc);
+
+							/* load session messages */
+							struct db_message *msgs = NULL;
+							int nm = db_messages_load(sid, &msgs);
+
+							msg_seq = 0;
+							user_msg_count = 0;
+							for (i = 0; i < nm && n_msg < 1 + MAX_TURNS * 2 - 1; i++) {
+								if (!msgs[i].llm_use)
+									continue;
+								if (strcmp(msgs[i].role, "system") == 0)
+									continue;
+								history_bufs[n_hist] = strdup(msgs[i].content);
+								roles[n_msg] = strcmp(msgs[i].role, "user") == 0 ? "user" : "assistant";
+								contents[n_msg] = history_bufs[n_hist];
+								n_msg++;
+								n_hist++;
+								if (strcmp(msgs[i].role, "user") == 0)
+									user_msg_count++;
+								if (msgs[i].seq > msg_seq)
+									msg_seq = msgs[i].seq;
+							}
+							msg_seq++;
+							db_messages_free(msgs, nm);
+
+							session_id = sid;
+							session_named = sessions[idx].name[0] != '\0' &&
+								strcmp(sessions[idx].name, "New session") != 0;
+
+							/* redraw and replay messages into the TUI */
+							tui_draw();
+							tui_draw_welcome(kc ? model_name : NULL);
+
+							char resume_msg[256];
+							snprintf(resume_msg, sizeof(resume_msg),
+								"Resumed session: %s",
+								sessions[idx].name);
+							tui_info(resume_msg);
+							tui_info("");
+
+							/* replay conversation into chat window */
+							for (int j = cfg->system_chat ? 1 : 0; j < n_msg; j++) {
+								if (strcmp(roles[j], "user") == 0) {
+									tui_user_msg(contents[j]);
+								} else {
+									tui_assistant_begin();
+									tui_assistant_chunk(contents[j], 0);
+									tui_assistant_end();
+								}
+							}
+
+							update_context_status(kc, roles, contents, n_msg);
+						}
+					}
+				}
 				free(input);
 			} else if (strcmp(input, "/clear") == 0) {
 				for (i = 0; i < n_hist; i++)
@@ -499,12 +802,19 @@ int main(int argc, char *argv[])
 				tui_draw();
 				tui_draw_welcome(kc ? model_name : NULL);
 				tui_info("Conversation cleared.");
+
+				/* start a fresh session */
+				session_id = -1;
+				msg_seq = 0;
+				user_msg_count = 0;
+				session_named = 0;
+
 				update_context_status(kc, roles, contents, n_msg);
 				free(input);
 			} else if (strcmp(input, "/compact") == 0) {
 				if (!kc) {
 					tui_info("No model loaded.");
-				} else if (generating || compacting || switching_model) {
+				} else if (generating || compacting || switching_model || naming_session) {
 					tui_info("Busy. Press ESC to cancel current task first.");
 				} else if (n_msg <= 1) {
 					tui_info("Nothing to compact.");
@@ -541,7 +851,9 @@ int main(int argc, char *argv[])
 					tui_info("  /model <name>              Switch model");
 					tui_info("  /pull <name|url>           Download a model");
 					tui_info("");
-				} else if (generating || compacting || switching_model) {
+				} else if (!valid_model_name(new_name)) {
+					tui_info("Invalid model name. Use alphanumeric, hyphens, dots, underscores.");
+				} else if (generating || compacting || switching_model || naming_session) {
 					tui_info("Busy. Press ESC to cancel current task first.");
 				} else {
 					char *new_path = resolve_model_path(new_name);
@@ -571,6 +883,8 @@ int main(int argc, char *argv[])
 					target++;
 				if (*target == '\0') {
 					tui_info("Usage: /pull <model|url>");
+				} else if (!valid_pull_target(target)) {
+					tui_info("Invalid target. Use a model name or https:// URL.");
 				} else if (dispatch_active()) {
 					tui_info("A background task is already running.");
 				} else {
@@ -588,7 +902,7 @@ int main(int argc, char *argv[])
 				snprintf(err_msg, sizeof(err_msg), "Unknown command: %s (type /help)", input);
 				tui_info(err_msg);
 				free(input);
-			} else if (generating || compacting || switching_model) {
+			} else if (generating || compacting || switching_model || naming_session) {
 				tui_info("Busy. Press ESC to cancel.");
 				free(input);
 			} else if (!kc) {
@@ -599,12 +913,26 @@ int main(int argc, char *argv[])
 				free(input);
 				running = 0;
 			} else {
+				/* create session on first user message */
+				if (session_id < 0) {
+					char cwd[512];
+					if (!getcwd(cwd, sizeof(cwd)))
+						cwd[0] = '\0';
+					session_id = db_session_create("chat",
+						model_name ? model_name : "", cwd);
+				}
+
 				/* add user message */
 				history_bufs[n_hist] = strdup(input);
 				roles[n_msg] = "user";
 				contents[n_msg] = history_bufs[n_hist];
 				n_msg++;
 				n_hist++;
+				user_msg_count++;
+
+				/* save user message to session */
+				if (session_id >= 0)
+					db_message_add(session_id, msg_seq++, "user", input, 1);
 
 				update_context_status(kc, roles, contents, n_msg);
 				/* apply template with full conversation */
@@ -678,11 +1006,18 @@ int main(int argc, char *argv[])
 			struct timespec ts = {0, 50000000};  /* 50ms */
 			nanosleep(&ts, NULL);
 		}
+		/* wait for naming to finish */
+		while (naming_session) {
+			struct timespec ts = {0, 50000000};
+			nanosleep(&ts, NULL);
+		}
 
 		free(gen_response);
 		gen_response = NULL;
 		free(compact_summary);
 		compact_summary = NULL;
+		free(session_name_result);
+		session_name_result = NULL;
 		if (switch_result) {
 			kora_free(switch_result);
 			switch_result = NULL;

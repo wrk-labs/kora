@@ -40,6 +40,60 @@ void db_model_set_active(const char *name);
 /* get the active model alias (or NULL). caller must NOT free. */
 const char *db_model_get_active(void);
 
+/* --- sessions --- */
+
+/* create a new session, returns the session id (or -1 on error) */
+int db_session_create(const char *mode, const char *model, const char *cwd);
+
+/* update session name (e.g. after auto-naming) */
+void db_session_set_name(int session_id, const char *name);
+
+/* touch updated_at timestamp */
+void db_session_touch(int session_id);
+
+/* delete a session and its messages */
+void db_session_delete(int session_id);
+
+/* session info returned by list/get */
+struct db_session {
+	int id;
+	char name[128];
+	char mode[16];
+	char model[128];
+	char created_at[32];
+	char updated_at[32];
+	char last_message[256];
+	int message_count;
+};
+
+/* list sessions (most recent first). returns count, fills out[] up to max.
+   caller provides the array. */
+int db_sessions_list(struct db_session *out, int max);
+
+/* get a single session by id. returns 0 on success, -1 if not found. */
+int db_session_get(int session_id, struct db_session *out);
+
+/* --- messages --- */
+
+/* append a message to a session */
+void db_message_add(int session_id, int seq, const char *role,
+                    const char *content, int llm_use);
+
+/* message info returned by load */
+struct db_message {
+	int seq;
+	char *role;
+	char *content;
+	int llm_use;
+};
+
+/* load all messages for a session. returns count, allocates *out.
+   caller must free each role/content and the array itself. */
+int db_messages_load(int session_id, struct db_message **out);
+
+/* free an array of messages returned by db_messages_load */
+void db_messages_free(struct db_message *msgs, int count);
+
 /* --- settings --- */
 
 /* get a setting value, returns NULL if not found. caller must free. */
