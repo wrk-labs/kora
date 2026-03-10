@@ -206,6 +206,11 @@ static void *switch_thread_fn(void *arg)
 	if (new_kc) {
 		switch_result = new_kc;
 		switch_model_name = sa->model_name;  /* transfer ownership */
+		char loaded_msg[256];
+		snprintf(loaded_msg, sizeof(loaded_msg),
+			 "Loaded %s", sa->model_name);
+		tui_info("");
+		tui_info(loaded_msg);
 	} else {
 		tui_info("");
 		tui_info("Failed to load model.");
@@ -596,10 +601,6 @@ int main(int argc, char *argv[])
 				n_hist = 0;
 				n_msg = cfg->system_chat ? 1 : 0;
 
-				char switch_msg[256];
-				snprintf(switch_msg, sizeof(switch_msg), "Switched to %s", model_name);
-				tui_info("");
-				tui_info(switch_msg);
 				update_context_status(kc, roles, contents, n_msg);
 			}
 

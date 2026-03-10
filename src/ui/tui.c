@@ -68,9 +68,14 @@ static char *hist_saved = NULL;  /* saved current line when browsing history */
 
 /* layout constants */
 #define HEADER_H   3
-#define INPUT_H    3
+#define INPUT_H_MIN 3
+#define INPUT_H_MAX 12
 #define STATUS_H   1
 #define BORDER_H   1
+
+/* multiline input state */
+static int input_h = INPUT_H_MIN;
+static int input_scroll = 0;  /* first visible line in multiline input */
 
 /* chat pad */
 #define PAD_INITIAL_H 1000
@@ -82,6 +87,139 @@ static int chat_scroll = 0;        /* scroll offset (0 = bottom) */
 
 /* poll interval for non-blocking input (ms) */
 #define POLL_INTERVAL_MS 16
+
+/* forward declarations for multiline input helpers */
+static int input_cur_line(void);
+static size_t input_line_start_pos(int line);
+static size_t input_line_end_pos(int line);
+static void recalc_input_height(void);
+
+/* forward declarations for visual (soft-wrap) helpers */
+static int input_content_width(void);
+static int input_visual_nlines(void);
+static void input_pos_to_visual(size_t pos, int *vrow, int *vcol);
+static size_t input_visual_to_pos(int target_vrow, int target_vcol);
+
+/* --- paste slot storage --- */
+
+/*
+ * Pasted content is stored in slots. Each slot is referenced by a single
+ * sentinel byte in input_buf (0x01 = slot 0, 0x02 = slot 1, ...).
+ * The sentinel is atomic: backspace/delete removes the whole byte,
+ * which frees the stored content. On submit, sentinels are expanded
+ * back to full text. No partial deletion or malformed state is possible.
+ */
+#define PASTE_MARKER_BASE 0x01
+#define MAX_PASTE_SLOTS   26
+#define PASTE_COLLAPSE_LINES 3
+#define PASTE_COLLAPSE_CHARS 150
+
+struct paste_slot {
+	char *content;
+	int nlines;
+};
+
+static struct paste_slot paste_slots[MAX_PASTE_SLOTS];
+static int paste_count = 0;
+
+static int is_paste_marker(char c)
+{
+	unsigned char uc = (unsigned char)c;
+	return uc >= PASTE_MARKER_BASE
+	    && uc < PASTE_MARKER_BASE + MAX_PASTE_SLOTS
+	    && (int)(uc - PASTE_MARKER_BASE) < paste_count;
+}
+
+static int paste_slot_of(char c)
+{
+	return (unsigned char)c - PASTE_MARKER_BASE;
+}
+
+/* get badge display text for a paste slot; returns length */
+static int paste_badge(int slot, char *buf, int bufsz)
+{
+	if (slot < 0 || slot >= paste_count)
+		return snprintf(buf, bufsz, "[Pasted]");
+	return snprintf(buf, bufsz, "[Pasted ~%d lines]",
+			paste_slots[slot].nlines);
+}
+
+/* visual width of a character in the input buffer */
+static int input_char_width(char c)
+{
+	if (is_paste_marker(c)) {
+		char tmp[32];
+		return paste_badge(paste_slot_of(c), tmp, sizeof(tmp));
+	}
+	return 1;
+}
+
+/* free a paste slot's content */
+static void paste_slot_free(int slot)
+{
+	if (slot >= 0 && slot < paste_count) {
+		free(paste_slots[slot].content);
+		paste_slots[slot].content = NULL;
+		paste_slots[slot].nlines = 0;
+	}
+}
+
+/* free all paste slots */
+static void paste_slots_clear(void)
+{
+	int i;
+	for (i = 0; i < paste_count; i++) {
+		free(paste_slots[i].content);
+		paste_slots[i].content = NULL;
+		paste_slots[i].nlines = 0;
+	}
+	paste_count = 0;
+}
+
+/* count lines in a string */
+static int count_lines(const char *s)
+{
+	int n = 1;
+	for (; *s; s++)
+		if (*s == '\n') n++;
+	return n;
+}
+
+/* expand all paste markers in a string, returns new allocated string */
+static char *paste_expand(const char *src, size_t len)
+{
+	/* first pass: compute total size */
+	size_t total = 0;
+	size_t i;
+	for (i = 0; i < len; i++) {
+		if (is_paste_marker(src[i])) {
+			int slot = paste_slot_of(src[i]);
+			if (paste_slots[slot].content)
+				total += strlen(paste_slots[slot].content);
+		} else {
+			total++;
+		}
+	}
+
+	char *out = malloc(total + 1);
+	if (!out) return strdup(src);
+
+	size_t pos = 0;
+	for (i = 0; i < len; i++) {
+		if (is_paste_marker(src[i])) {
+			int slot = paste_slot_of(src[i]);
+			if (paste_slots[slot].content) {
+				size_t clen = strlen(paste_slots[slot].content);
+				memcpy(out + pos, paste_slots[slot].content, clen);
+				pos += clen;
+			}
+		} else {
+			out[pos++] = src[i];
+		}
+	}
+	out[pos] = '\0';
+	return out;
+}
 
 /* --- internal draw functions (main thread only) --- */
 
@@ -176,19 +314,104 @@ static void draw_header(void)
 
 static void draw_input_box(void)
 {
+	int vis_lines, w;
+	int cur_vrow, cur_vcol;
+	int vl, col;
+	size_t i;
+	int needs_prefix;
+
 	if (!win_input) return;
+
+	vis_lines = input_h - 2; /* visible content rows */
+	w = input_content_width();
+	if (w < 1) w = 1;
+
+	input_pos_to_visual(input_pos, &cur_vrow, &cur_vcol);
+
+	/* adjust scroll to keep cursor visible */
+	if (cur_vrow < input_scroll)
+		input_scroll = cur_vrow;
+	if (cur_vrow >= input_scroll + vis_lines)
+		input_scroll = cur_vrow - vis_lines + 1;
 
 	werase(win_input);
 	box(win_input, 0, 0);
 
-	/* draw current input text */
-	mvwprintw(win_input, 1, 2, "> ");
-	if (input_buf && input_len > 0)
-		mvwprintw(win_input, 1, 4, "%s", input_buf);
+	/* render buffer with soft wrapping and paste badges */
+	vl = 0;
+	col = 0;
+	needs_prefix = 1;
 
-	/* position cursor — this window is always refreshed last
-	   so the physical cursor stays here */
-	wmove(win_input, 1, 4 + (int)input_pos);
+	for (i = 0; i <= input_len; i++) {
+		if (vl >= input_scroll + vis_lines)
+			break;
+
+		/* draw prefix at start of each visible visual line */
+		if (needs_prefix && vl >= input_scroll) {
+			int row = 1 + (vl - input_scroll);
+			if (vl == 0)
+				mvwprintw(win_input, row, 2, "> ");
+			else
+				mvwprintw(win_input, row, 2, "  ");
+			needs_prefix = 0;
+		}
+
+		if (i == input_len)
+			break;
+
+		if (input_buf[i] == '\n') {
+			vl++;
+			col = 0;
+			needs_prefix = 1;
+			continue;
+		}
+
+		if (is_paste_marker(input_buf[i])) {
+			/* draw paste badge */
+			char badge[32];
+			int blen = paste_badge(paste_slot_of(input_buf[i]),
+					       badge, sizeof(badge));
+			int j;
+			for (j = 0; j < blen; j++) {
+				if (col >= w) {
+					vl++;
+					col = 0;
+					needs_prefix = 1;
+					if (vl >= input_scroll + vis_lines)
+						break;
+					if (needs_prefix && vl >= input_scroll) {
+						int row = 1 + (vl - input_scroll);
+						mvwprintw(win_input, row, 2, "  ");
+						needs_prefix = 0;
+					}
+				}
+				if (vl >= input_scroll) {
+					int row = 1 + (vl - input_scroll);
+					wattron(win_input, A_DIM);
+					mvwaddch(win_input, row, 4 + col, badge[j]);
+					wattroff(win_input, A_DIM);
+				}
+				col++;
+			}
+			continue;
+		}
+
+		/* draw regular character if on a visible visual line */
+		if (vl >= input_scroll) {
+			int row = 1 + (vl - input_scroll);
+			mvwaddch(win_input, row, 4 + col, input_buf[i]);
+		}
+
+		col++;
+		if (col >= w) {
+			vl++;
+			col = 0;
+			needs_prefix = 1;
+		}
+	}
+
+	/* position cursor */
+	wmove(win_input, 1 + (cur_vrow - input_scroll), 4 + cur_vcol);
 	wrefresh(win_input);
 }
 
@@ -198,8 +421,8 @@ static void layout_windows(void)
 	int input_y;
 
 	getmaxyx(stdscr, rows, cols);
-	/* header(1) + border(1) + chat + border(1) + input(3) + status(1) */
-	chat_h = rows - HEADER_H - INPUT_H - STATUS_H - 2;
+	/* header(3) + border(1) + chat + border(1) + input(dynamic) + status(1) */
+	chat_h = rows - HEADER_H - input_h - STATUS_H - 2;
 	if (chat_h < 1) chat_h = 1;
 	chat_y = HEADER_H + BORDER_H;
 	chat_cols = cols;
@@ -220,8 +443,8 @@ static void layout_windows(void)
 	}
 
 	input_y = chat_y + chat_h + BORDER_H;
-	win_input = newwin(INPUT_H, cols, input_y, 0);
-	win_status = newwin(STATUS_H, cols, input_y + INPUT_H, 0);
+	win_input = newwin(input_h, cols, input_y, 0);
+	win_status = newwin(STATUS_H, cols, input_y + input_h, 0);
 
 	keypad(win_input, TRUE);
 
@@ -253,7 +476,7 @@ static void statusbar_set_right(const char *text)
 	draw_input_box();
 }
 
-static const char *default_statusbar = "/help";
+static const char *default_statusbar = "/help  Alt+Enter: new line";
 
 /* command table for dynamic statusbar hints */
 static const char *slash_commands[] = {
@@ -294,60 +517,40 @@ static void update_dynamic_statusbar(void)
 /* --- internal renderers (main thread only) --- */
 
 /* print a line with background highlight filling the full row width */
-static void print_highlighted_line(WINDOW *win, const char *text, int attr)
-{
-	int cols = getmaxx(win);
-	int len, pad;
-	char *line;
-
-	/* "  text" with padding to fill full width */
-	len = (int)strlen(text) + 2;  /* 2 for leading spaces */
-	pad = len < cols ? cols - len : 0;
-
-	line = malloc(len + pad + 1);
-	if (!line) {
-		wprintw(win, "  %s\n", text);
-		return;
-	}
-
-	line[0] = ' ';
-	line[1] = ' ';
-	memcpy(line + 2, text, strlen(text));
-	memset(line + len, ' ', pad);
-	line[len + pad] = '\0';
-
-	wattron(win, attr);
-	wprintw(win, "%s", line);
-	wattroff(win, attr);
-	wprintw(win, "\n");
-	free(line);
-}
-
 static void render_user_msg(const char *text)
 {
+	int cols;
 	const char *p, *end;
+	int tlen, pad;
 
 	if (!win_chat) return;
 
 	chat_pad_ensure();
 	chat_scroll_bottom();
+	cols = getmaxx(win_chat);
 
 	wprintw(win_chat, "\n");
 
-	/* handle multi-line input: highlight each line separately */
+	/* render entire message as a single highlighted block.
+	   each line gets 2-space indent and is padded to full width
+	   so the background highlight is continuous (no gaps). */
+	wattron(win_chat, user_msg_attr);
 	p = text;
 	while (*p) {
 		end = strchr(p, '\n');
-		if (end) {
-			char *line = strndup(p, end - p);
-			print_highlighted_line(win_chat, line ? line : p, user_msg_attr);
-			free(line);
+		tlen = end ? (int)(end - p) : (int)strlen(p);
+		pad = cols - tlen - 2;
+		if (pad < 0) pad = 0;
+
+		wprintw(win_chat, "  %.*s%*s", tlen, p, pad, "");
+
+		if (end)
 			p = end + 1;
-		} else {
-			print_highlighted_line(win_chat, p, user_msg_attr);
+		else
 			break;
-		}
 	}
+	wattroff(win_chat, user_msg_attr);
+	wprintw(win_chat, "\n");
 	refresh_chat();
 }
 
@@ -474,6 +677,7 @@ static void input_clear(void)
 	input_pos = 0;
 	if (input_buf)
 		input_buf[0] = '\0';
+	paste_slots_clear();
 }
 
 static void history_add(const char *line)
@@ -500,6 +704,190 @@ static void input_set(const char *text)
 	memcpy(input_buf, text, len + 1);
 	input_len = len;
 	input_pos = len;
+}
+
+/* --- multiline input helpers --- */
+
+/* which logical line (0-based) the cursor is on */
+static int input_cur_line(void)
+{
+	int line = 0;
+	size_t i;
+	for (i = 0; i < input_pos; i++)
+		if (input_buf[i] == '\n') line++;
+	return line;
+}
+
+/* start position of logical line n (0-based) */
+static size_t input_line_start_pos(int line)
+{
+	size_t i;
+	int cur = 0;
+	if (line <= 0) return 0;
+	for (i = 0; i < input_len; i++) {
+		if (input_buf[i] == '\n') {
+			cur++;
+			if (cur == line) return i + 1;
+		}
+	}
+	return input_len;
+}
+
+/* end position of line n (position of '\n' or input_len) */
+static size_t input_line_end_pos(int line)
+{
+	size_t start = input_line_start_pos(line);
+	size_t i;
+	for (i = start; i < input_len; i++) {
+		if (input_buf[i] == '\n') return i;
+	}
+	return input_len;
+}
+
+/* insert a character at cursor position */
+static void input_insert_char(char c)
+{
+	input_buf_grow(input_len + 1);
+	if (input_pos < input_len)
+		memmove(input_buf + input_pos + 1,
+			input_buf + input_pos,
+			input_len - input_pos);
+	input_buf[input_pos] = c;
+	input_pos++;
+	input_len++;
+	input_buf[input_len] = '\0';
+}
+
+/* --- visual (soft-wrap aware) helpers --- */
+
+/* available text width per row inside the input box */
+static int input_content_width(void)
+{
+	if (!win_input) return 40;
+	/* cols - left_border(1) - prefix_space(1) - "> "(2) - right_border(1) */
+	int w = getmaxx(win_input) - 5;
+	return w > 1 ? w : 1;
+}
+
+/* advance visual column by cw chars, handling soft wrapping */
+static void advance_col(int cw, int w, int *vl, int *col)
+{
+	*col += cw;
+	while (*col >= w) {
+		(*vl)++;
+		*col -= w;
+	}
+}
+
+/* count total visual lines considering soft wrapping and paste badges */
+static int input_visual_nlines(void)
+{
+	int w = input_content_width();
+	int vlines = 1;
+	int col = 0;
+	size_t i;
+
+	for (i = 0; i < input_len; i++) {
+		if (input_buf[i] == '\n') {
+			vlines++;
+			col = 0;
+		} else {
+			int cw = input_char_width(input_buf[i]);
+			col += cw;
+			while (col >= w) {
+				vlines++;
+				col -= w;
+			}
+		}
+	}
+	return vlines;
+}
+
+/* convert buffer position to visual (row, col) accounting for
+   soft wrapping and paste badges */
+static void input_pos_to_visual(size_t pos, int *vrow, int *vcol)
+{
+	int w = input_content_width();
+	int r = 0, c = 0;
+	size_t i;
+
+	for (i = 0; i < pos && i < input_len; i++) {
+		if (input_buf[i] == '\n') {
+			r++;
+			c = 0;
+		} else {
+			advance_col(input_char_width(input_buf[i]), w, &r, &c);
+		}
+	}
+	*vrow = r;
+	*vcol = c;
+}
+
+/* convert visual (row, col) to buffer position (clamps col to line end).
+   paste markers are atomic — if target falls inside a badge, snaps to
+   the marker position */
+static size_t input_visual_to_pos(int target_vrow, int target_vcol)
+{
+	int w = input_content_width();
+	int vl = 0, col = 0;
+	size_t i;
+	size_t last_on_row = 0;
+	int on_target = 0;
+
+	for (i = 0; i < input_len; i++) {
+		if (vl == target_vrow) {
+			on_target = 1;
+			if (col >= target_vcol)
+				return i;
+			last_on_row = i;
+		} else if (on_target) {
+			return last_on_row;
+		}
+
+		if (input_buf[i] == '\n') {
+			vl++;
+			col = 0;
+		} else {
+			int cw = input_char_width(input_buf[i]);
+			int old_vl = vl;
+			advance_col(cw, w, &vl, &col);
+			/* if we wrapped past the target row, clamp */
+			if (old_vl == target_vrow && vl > target_vrow && on_target)
+				return i;
+		}
+	}
+
+	if (vl == target_vrow)
+		return input_len;
+	if (on_target)
+		return last_on_row;
+	return input_len;
+}
+
+/* recalculate input box height based on visual line count */
+static void recalc_input_height(void)
+{
+	int rows, cols;
+	int nlines = input_visual_nlines();
+	int new_h = nlines + 2; /* border + lines + border */
+	int max_h;
+
+	getmaxyx(stdscr, rows, cols);
+	(void)cols;
+	max_h = rows / 2;
+	if (max_h < INPUT_H_MIN) max_h = INPUT_H_MIN;
+	if (max_h > INPUT_H_MAX) max_h = INPUT_H_MAX;
+
+	if (new_h < INPUT_H_MIN) new_h = INPUT_H_MIN;
+	if (new_h > max_h) new_h = max_h;
+
+	if (new_h != input_h) {
+		input_h = new_h;
+		layout_windows();
+		draw_header();
+		refresh_chat();
+		draw_statusbar();
+	}
 }
 
 /* --- resize handler --- */
@@ -556,6 +944,10 @@ void tui_init(void)
 	mouseinterval(0);
 	signal(SIGWINCH, on_resize);
 
+	/* enable bracketed paste mode */
+	printf("\033[?2004h");
+	fflush(stdout);
+
 	/* init input buffer */
 	input_buf_grow(128);
 	input_buf[0] = '\0';
@@ -580,6 +972,10 @@ void tui_cleanup(void)
 	if (win_input) { delwin(win_input); win_input = NULL; }
 	if (win_status) { delwin(win_status); win_status = NULL; }
 
+	/* disable bracketed paste mode */
+	printf("\033[?2004l");
+	fflush(stdout);
+
 	curs_set(1);
 	endwin();
 
@@ -589,6 +985,7 @@ void tui_cleanup(void)
 	input_cap = 0;
 	input_len = 0;
 	input_pos = 0;
+	paste_slots_clear();
 
 	free(hist_saved);
 	hist_saved = NULL;
@@ -644,6 +1041,14 @@ void tui_draw(void)
 void tui_input_clear(void)
 {
 	input_clear();
+	input_scroll = 0;
+	if (input_h != INPUT_H_MIN) {
+		input_h = INPUT_H_MIN;
+		layout_windows();
+		draw_header();
+		refresh_chat();
+		draw_statusbar();
+	}
 	update_dynamic_statusbar();
 }
 
@@ -795,7 +1200,6 @@ void tui_spinner(int on)
 char *tui_input(const char *prompt)
 {
 	int ch;
-	int max_visible;
 
 	(void)prompt;
 
@@ -823,50 +1227,178 @@ char *tui_input(const char *prompt)
 		if (ch == ERR)
 			continue;  /* timeout, no input — loop and drain again */
 
-		max_visible = getmaxx(win_input) - 6;  /* minus borders + "> " */
-		if (max_visible < 1) max_visible = 1;
-
 		switch (ch) {
 		case '\n':
 		case '\r':
 		case KEY_ENTER:
 			/* submit */
+			input_scroll = 0;
+			if (input_h != INPUT_H_MIN) {
+				input_h = INPUT_H_MIN;
+				layout_windows();
+				draw_header();
+				refresh_chat();
+				draw_statusbar();
+			}
 			wtimeout(win_input, -1);  /* restore blocking */
 			curs_set(0);
 			if (input_buf) {
+				char *result;
 				input_buf[input_len] = '\0';
-				history_add(input_buf);
-				return strdup(input_buf);
+				/* expand paste markers to full content */
+				if (paste_count > 0)
+					result = paste_expand(input_buf,
+							      input_len);
+				else
+					result = strdup(input_buf);
+				history_add(result);
+				paste_slots_clear();
+				return result;
 			}
 			return strdup("");
 
-		case 27:  /* ESC — could be escape key or alt sequence */
-			/* for now, treat as cancel / empty return */
-			wtimeout(win_input, -1);
-			curs_set(0);
-			return strdup("");
+		case 27: { /* ESC — could be escape key, Alt+key, or paste sequence */
+			int next;
+			wtimeout(win_input, 50);
+			next = wgetch(win_input);
+			wtimeout(win_input, POLL_INTERVAL_MS);
+
+			if (next == '\n' || next == '\r' || next == KEY_ENTER) {
+				/* Alt+Enter: insert newline */
+				input_insert_char('\n');
+				recalc_input_height();
+				update_dynamic_statusbar();
+				break;
+			}
+
+			if (next == '[') {
+				/* could be bracketed paste: ESC [ 2 0 0 ~ */
+				int seq[4];
+				int si = 0;
+				wtimeout(win_input, 50);
+				for (si = 0; si < 4; si++) {
+					seq[si] = wgetch(win_input);
+					if (seq[si] == ERR) break;
+				}
+				wtimeout(win_input, POLL_INTERVAL_MS);
+
+				if (si == 4 && seq[0] == '2' && seq[1] == '0'
+				    && seq[2] == '0' && seq[3] == '~') {
+					/* bracketed paste — collect all content first */
+					size_t pcap = 4096, plen = 0;
+					char *pbuf = malloc(pcap);
+					int pc, end_state = 0;
+
+					wtimeout(win_input, 100);
+					while (pbuf) {
+						pc = wgetch(win_input);
+						if (pc == ERR) break;
+
+						/* detect ESC[201~ end sequence */
+						switch (end_state) {
+						case 0: end_state = (pc == 27) ? 1 : 0; break;
+						case 1: end_state = (pc == '[') ? 2 : 0; break;
+						case 2: end_state = (pc == '2') ? 3 : 0; break;
+						case 3: end_state = (pc == '0') ? 4 : 0; break;
+						case 4: end_state = (pc == '1') ? 5 : 0; break;
+						case 5: end_state = (pc == '~') ? 6 : 0; break;
+						}
+						if (end_state == 6) break;
+
+						if (end_state == 0) {
+							if (plen + 2 >= pcap) {
+								pcap *= 2;
+								char *nb = realloc(pbuf, pcap);
+								if (!nb) break;
+								pbuf = nb;
+							}
+							if (pc == '\n' || pc == '\r')
+								pbuf[plen++] = '\n';
+							else if (pc >= 32 && pc < 127)
+								pbuf[plen++] = (char)pc;
+							else if (pc == '\t')
+								pbuf[plen++] = '\t';
+						}
+					}
+					wtimeout(win_input, POLL_INTERVAL_MS);
+
+					if (pbuf) {
+						pbuf[plen] = '\0';
+						int nlines = count_lines(pbuf);
+
+						if ((nlines >= PASTE_COLLAPSE_LINES
+						     || (int)plen > PASTE_COLLAPSE_CHARS)
+						    && paste_count < MAX_PASTE_SLOTS) {
+							/* collapse into a paste slot */
+							int slot = paste_count++;
+							paste_slots[slot].content = pbuf;
+							paste_slots[slot].nlines = nlines;
+							input_insert_char(
+								(char)(PASTE_MARKER_BASE + slot));
+						} else {
+							/* small paste — insert inline */
+							size_t pi;
+							for (pi = 0; pi < plen; pi++)
+								input_insert_char(pbuf[pi]);
+							free(pbuf);
+						}
+					}
+
+					recalc_input_height();
+					update_dynamic_statusbar();
+					draw_input_box();
+				}
+				/* else: unknown CSI sequence, ignore */
+				break;
+			}
+
+			if (next == ERR) {
+				/* plain ESC: cancel */
+				input_scroll = 0;
+				if (input_h != INPUT_H_MIN) {
+					input_h = INPUT_H_MIN;
+					layout_windows();
+					draw_header();
+					refresh_chat();
+					draw_statusbar();
+				}
+				wtimeout(win_input, -1);
+				curs_set(0);
+				return strdup("");
+			}
+			/* other Alt+key: ignore */
+			break;
+		}
 
 		case KEY_BACKSPACE:
 		case 127:
 		case 8:
 			if (input_pos > 0) {
+				if (is_paste_marker(input_buf[input_pos - 1]))
+					paste_slot_free(paste_slot_of(
+						input_buf[input_pos - 1]));
 				memmove(input_buf + input_pos - 1,
 					input_buf + input_pos,
 					input_len - input_pos);
 				input_pos--;
 				input_len--;
 				input_buf[input_len] = '\0';
+				recalc_input_height();
 				update_dynamic_statusbar();
 			}
 			break;
 
 		case KEY_DC:  /* delete key */
 			if (input_pos < input_len) {
+				if (is_paste_marker(input_buf[input_pos]))
+					paste_slot_free(paste_slot_of(
+						input_buf[input_pos]));
 				memmove(input_buf + input_pos,
 					input_buf + input_pos + 1,
 					input_len - input_pos - 1);
 				input_len--;
 				input_buf[input_len] = '\0';
+				recalc_input_height();
 				update_dynamic_statusbar();
 			}
 			break;
@@ -886,59 +1418,102 @@ char *tui_input(const char *prompt)
 			break;
 
 		case KEY_HOME:
-		case 1:  /* Ctrl-A */
-			input_pos = 0;
+		case 1:  /* Ctrl-A: start of current line */
+			input_pos = input_line_start_pos(input_cur_line());
 			draw_input_box();
 			break;
 
 		case KEY_END:
-		case 5:  /* Ctrl-E */
-			input_pos = input_len;
+		case 5:  /* Ctrl-E: end of current line */
+			input_pos = input_line_end_pos(input_cur_line());
 			draw_input_box();
 			break;
 
-		case KEY_UP:
-			if (hist_count == 0) break;
-			if (hist_idx == hist_count) {
-				free(hist_saved);
-				hist_saved = strdup(input_buf ? input_buf : "");
-			}
-			if (hist_idx > 0) {
-				hist_idx--;
-				input_set(input_history[hist_idx]);
-				update_dynamic_statusbar();
-			}
-			break;
-
-		case KEY_DOWN:
-			if (hist_idx < hist_count) {
-				hist_idx++;
-				if (hist_idx == hist_count && hist_saved) {
-					input_set(hist_saved);
-				} else if (hist_idx < hist_count) {
-					input_set(input_history[hist_idx]);
+		case KEY_UP: {
+			int vrow, vcol;
+			input_pos_to_visual(input_pos, &vrow, &vcol);
+			if (vrow > 0) {
+				/* move cursor up one visual row */
+				input_pos = input_visual_to_pos(vrow - 1, vcol);
+			} else {
+				/* first visual row: browse history */
+				if (hist_count == 0) break;
+				if (hist_idx == hist_count) {
+					free(hist_saved);
+					hist_saved = strdup(input_buf ? input_buf : "");
 				}
-				update_dynamic_statusbar();
+				if (hist_idx > 0) {
+					hist_idx--;
+					input_set(input_history[hist_idx]);
+					recalc_input_height();
+				}
 			}
+			update_dynamic_statusbar();
 			break;
+		}
+
+		case KEY_DOWN: {
+			int vrow, vcol;
+			int total_vlines = input_visual_nlines();
+			input_pos_to_visual(input_pos, &vrow, &vcol);
+			if (vrow < total_vlines - 1) {
+				/* move cursor down one visual row */
+				input_pos = input_visual_to_pos(vrow + 1, vcol);
+			} else {
+				/* last visual row: browse history */
+				if (hist_idx < hist_count) {
+					hist_idx++;
+					if (hist_idx == hist_count && hist_saved) {
+						input_set(hist_saved);
+					} else if (hist_idx < hist_count) {
+						input_set(input_history[hist_idx]);
+					}
+					recalc_input_height();
+				}
+			}
+			update_dynamic_statusbar();
+			break;
+		}
 
 		case 21:  /* Ctrl-U: clear line */
 			input_clear();
+			input_scroll = 0;
+			recalc_input_height();
 			update_dynamic_statusbar();
 			break;
 
-		case 23:  /* Ctrl-W: delete word backwards */
+		case 23:  /* Ctrl-W: delete word backwards (stops at newlines and paste markers) */
 			if (input_pos > 0) {
 				size_t old_pos = input_pos;
-				while (input_pos > 0 && input_buf[input_pos - 1] == ' ')
+				size_t di;
+				/* if immediately before a paste marker, just delete it */
+				if (is_paste_marker(input_buf[input_pos - 1])) {
+					paste_slot_free(paste_slot_of(
+						input_buf[input_pos - 1]));
 					input_pos--;
-				while (input_pos > 0 && input_buf[input_pos - 1] != ' ')
-					input_pos--;
+				} else {
+					while (input_pos > 0
+					       && input_buf[input_pos - 1] == ' ')
+						input_pos--;
+					while (input_pos > 0
+					       && input_buf[input_pos - 1] != ' '
+					       && input_buf[input_pos - 1] != '\n'
+					       && !is_paste_marker(
+							input_buf[input_pos - 1]))
+						input_pos--;
+				}
+				/* free any paste markers in the deleted range */
+				for (di = input_pos; di < old_pos; di++) {
+					if (is_paste_marker(input_buf[di]))
+						paste_slot_free(
+							paste_slot_of(input_buf[di]));
+				}
 				memmove(input_buf + input_pos,
 					input_buf + old_pos,
 					input_len - old_pos);
 				input_len -= (old_pos - input_pos);
 				input_buf[input_len] = '\0';
+				recalc_input_height();
 				update_dynamic_statusbar();
 			}
 			break;
@@ -1036,6 +1611,7 @@ char *tui_input(const char *prompt)
 				input_pos++;
 				input_len++;
 				input_buf[input_len] = '\0';
+				recalc_input_height();
 				update_dynamic_statusbar();
 			}
 			break;
