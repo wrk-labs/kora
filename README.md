@@ -34,8 +34,10 @@ make GGML_METAL=1     # Apple Silicon
 ## Usage
 
 ```
-kora chat [model]     # start chatting
+kora                  # start chatting (default)
+kora chat [model]     # start chatting with a specific model
 kora code [model]     # coding assistant (wip)
+kora help             # print usage information
 kora version          # print version
 ```
 
@@ -47,6 +49,7 @@ kora version          # print version
 /pull <name>    Download a model
 /compact        Summarize conversation to free context
 /clear          Clear conversation history
+/resume [id]    Resume a previous session
 /exit           Quit chat
 ```
 
@@ -60,8 +63,9 @@ All data lives under `~/.kora/`:
 ~/.kora/
 ├── models/         # downloaded GGUF files
 ├── sessions/       # conversation history
+├── plugins/        # user plugins
 ├── config.lua      # settings
-└── plugins/        # user plugins
+└── kora.db         # session and model database (SQLite)
 ```
 
 ## Architecture
@@ -72,10 +76,10 @@ kora/
 │   ├── core/       # main loop, config, database, dispatch
 │   ├── llm/        # inference, model management, registry
 │   ├── ui/         # TUI (ncurses), event queue, status handlers, input
+│   ├── sql/        # schema and migrations
 │   └── agent/      # Lua bridge
 ├── lua/            # Lua agent and plugins
-│   ├── core/
-│   └── plugins/
+│   └── core/
 ├── vendor/         # llama.cpp, Lua 5.5 (vendored)
 ├── Makefile
 ├── config.mk
