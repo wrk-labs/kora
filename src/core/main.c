@@ -391,17 +391,12 @@ static char *resolve_model_path(const char *model_name)
 
 int main(int argc, char *argv[])
 {
-	if (argc < 2) {
-		usage();
-		return 0;
-	}
-
-	if (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0) {
+	if (argc >= 2 && (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0)) {
 		version();
 		return 0;
 	}
 
-	if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0) {
+	if (argc >= 2 && (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0)) {
 		usage();
 		return 0;
 	}
@@ -417,7 +412,7 @@ int main(int argc, char *argv[])
 	}
 	db_models_sync();
 
-	if (strcmp(argv[1], "chat") == 0) {
+	if (argc < 2 || strcmp(argv[1], "chat") == 0) {
 		/* load config */
 		struct kora_config *cfg = kora_config_load(LUADIR);
 		struct kora_ctx *kc = NULL;

@@ -1621,27 +1621,21 @@ char *tui_input(const char *prompt)
 
 /* --- welcome screen --- */
 
-/* read and print the ASCII logo from file */
+/* embedded ASCII logo */
+static const char *logo_lines[] = {
+	"▗▖ ▗▖ ▗▄▖ ▗▄▄▖  ▗▄▖",
+	"▐▌▗▞▘▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌",
+	"▐▛▚▖ ▐▌ ▐▌▐▛▀▚▖▐▛▀▜▌",
+	"▐▌ ▐▌▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌",
+	NULL
+};
+
 static void draw_logo(void)
 {
-	FILE *f = NULL;
-	char line[256];
-
-	/* try source tree first, then installed path */
-	f = fopen("src/branding/ascii-logo.txt", "r");
-	if (!f) {
-		char path[512];
-		snprintf(path, sizeof(path), "%s/branding/ascii-logo.txt", LUADIR);
-		f = fopen(path, "r");
-	}
-
-	if (!f) return;
-
 	wattron(win_chat, A_BOLD);
-	while (fgets(line, sizeof(line), f))
-		wprintw(win_chat, "  %s", line);
+	for (const char **p = logo_lines; *p; p++)
+		wprintw(win_chat, "  %s\n", *p);
 	wattroff(win_chat, A_BOLD);
-	fclose(f);
 }
 
 void tui_draw_welcome(const char *model)
