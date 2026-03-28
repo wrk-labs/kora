@@ -418,7 +418,7 @@ int main(int argc, char *argv[])
 
 	/* --- CLI-only commands (no TUI) --- */
 
-	if (strcmp(argv[1], "pull") == 0) {
+	if (argc >= 2 && strcmp(argv[1], "pull") == 0) {
 		if (argc < 3) {
 			fprintf(stderr, "Usage: kora pull <model|url>\n\n"
 				"Available models:\n");
@@ -442,13 +442,13 @@ int main(int argc, char *argv[])
 		return rc != 0 ? 1 : 0;
 	}
 
-	if (strcmp(argv[1], "list") == 0) {
+	if (argc >= 2 && strcmp(argv[1], "list") == 0) {
 		model_list();
 		db_close();
 		return 0;
 	}
 
-	if (strcmp(argv[1], "rm") == 0) {
+	if (argc >= 2 && strcmp(argv[1], "rm") == 0) {
 		if (argc < 3) {
 			fprintf(stderr, "Usage: kora rm <model>\n");
 			db_close();
@@ -465,7 +465,7 @@ int main(int argc, char *argv[])
 		return rc != 0 ? 1 : 0;
 	}
 
-	if (strcmp(argv[1], "serve") == 0) {
+	if (argc >= 2 && strcmp(argv[1], "serve") == 0) {
 		const char *model_name = NULL;
 		const char *port = "8012";
 		const char *ctx_size = "8192";
@@ -520,16 +520,16 @@ int main(int argc, char *argv[])
 		free(preferred);
 
 		/* find llama-server: next to kora binary, then PATH */
-		char self[512];
-		char server_path[512];
+		char self[256];
+		char server_path[280];
 		ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
-		if (len > 0) {
+		if (len > 0 && len < (ssize_t)sizeof(self) - 1) {
 			self[len] = '\0';
 			char *slash = strrchr(self, '/');
-			if (slash) {
+			if (slash && (size_t)(slash - self + 1) + 13 < sizeof(server_path)) {
 				*(slash + 1) = '\0';
 				snprintf(server_path, sizeof(server_path),
-					"%sllama-server", self);
+					"%s%s", self, "llama-server");
 				if (access(server_path, X_OK) == 0) {
 					execl(server_path, "llama-server",
 					      "-m", model_path,
