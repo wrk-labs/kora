@@ -13,6 +13,7 @@ BIN = kora
 
 LLAMA_BUILD = vendor/llama.cpp/build
 LLAMA_LIB = $(LLAMA_BUILD)/src/libllama.a
+LLAMA_SERVER = $(LLAMA_BUILD)/bin/llama-server
 GGML_LIBS = $(LLAMA_BUILD)/ggml/src/libggml.a \
             $(LLAMA_BUILD)/ggml/src/libggml-base.a \
             $(LLAMA_BUILD)/ggml/src/libggml-cpu.a \
@@ -37,7 +38,7 @@ else
 endif
 
 # default target
-all: $(BIN)
+all: $(BIN) $(LLAMA_SERVER)
 
 # --- schema embedding ---
 SCHEMA_HDR = src/core/schema_sql.h
@@ -51,12 +52,12 @@ $(SCHEMA_HDR): src/sql/schema.sql
 src/core/db.o: $(SCHEMA_HDR)
 
 # --- vendor libs ---
-$(LLAMA_LIB):
+$(LLAMA_LIB) $(LLAMA_SERVER):
 	cmake -S vendor/llama.cpp -B $(LLAMA_BUILD) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DLLAMA_BUILD_TESTS=OFF \
 		-DLLAMA_BUILD_EXAMPLES=OFF \
-		-DLLAMA_BUILD_SERVER=OFF \
+		-DLLAMA_BUILD_SERVER=ON \
 		-DBUILD_SHARED_LIBS=OFF \
 		$(LLAMA_CMAKE_FLAGS)
 	cmake --build $(LLAMA_BUILD) --config Release -j$(NPROC)
@@ -67,28 +68,32 @@ $(LUA_LIB):
 # --- kora binary ---
 $(BIN): $(OBJ) $(LLAMA_LIB) $(LUA_LIB)
 	$(CXX) -o $@ $(OBJ) $(LLAMA_LIB) $(GGML_LIBS) $(LUA_LIB) $(LDFLAGS) $(PLATFORM_LIBS)
+	cp -f $(LLAMA_SERVER) ./llama-server
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(BIN) $(OBJ) $(SCHEMA_HDR)
+	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
 
 clean-all: clean
 	rm -rf $(LLAMA_BUILD)
 	$(MAKE) -C vendor/lua clean
 
-install: $(BIN)
+install: $(BIN) $(LLAMA_SERVER)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	mkdir -p $(DESTDIR)$(LUADIR)/core
 	mkdir -p $(DESTDIR)$(LUADIR)/plugins
 	cp -f $(BIN) $(DESTDIR)$(PREFIX)/bin
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	cp -f $(LLAMA_SERVER) $(DESTDIR)$(PREFIX)/bin/llama-server
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/llama-server
 	cp -f lua/core/*.lua $(DESTDIR)$(LUADIR)/core/ 2>/dev/null || true
 	cp -f lua/plugins/*.lua $(DESTDIR)$(LUADIR)/plugins/ 2>/dev/null || true
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	rm -f $(DESTDIR)$(PREFIX)/bin/llama-server
 	rm -rf $(DESTDIR)$(LUADIR)
 
 .PHONY: all clean clean-all install uninstall

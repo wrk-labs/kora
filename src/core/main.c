@@ -358,6 +358,10 @@ static void usage(void)
 	       "Commands:\n"
 	       "  chat [model]    Interactive chat\n"
 	       "  code [model]    Agentic coding assistant\n"
+	       "  pull <model>    Download a model\n"
+	       "  list            List downloaded models\n"
+	       "  rm <model>      Remove a model\n"
+	       "  serve [model]   Start local inference server\n"
 	       "  version         Print version\n");
 }
 
@@ -411,6 +415,146 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	db_models_sync();
+
+	/* --- CLI-only commands (no TUI) --- */
+
+	if (strcmp(argv[1], "pull") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "Usage: kora pull <model|url>\n\n"
+				"Available models:\n");
+			int i;
+			for (i = 0; registry[i].alias; i++)
+				fprintf(stderr, "  %-20s %s  %s\n",
+					registry[i].alias, registry[i].size,
+					registry[i].quant);
+			fprintf(stderr, "\nOr provide a direct URL: "
+				"kora pull https://...\n");
+			db_close();
+			return 1;
+		}
+		if (!valid_pull_target(argv[2])) {
+			fprintf(stderr, "kora: invalid target '%s'\n", argv[2]);
+			db_close();
+			return 1;
+		}
+		int rc = model_pull(argv[2]);
+		db_close();
+		return rc != 0 ? 1 : 0;
+	}
+
+	if (strcmp(argv[1], "list") == 0) {
+		model_list();
+		db_close();
+		return 0;
+	}
+
+	if (strcmp(argv[1], "rm") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "Usage: kora rm <model>\n");
+			db_close();
+			return 1;
+		}
+		if (!valid_model_name(argv[2])) {
+			fprintf(stderr, "kora: invalid model name '%s'\n",
+				argv[2]);
+			db_close();
+			return 1;
+		}
+		int rc = model_rm(argv[2]);
+		db_close();
+		return rc != 0 ? 1 : 0;
+	}
+
+	if (strcmp(argv[1], "serve") == 0) {
+		const char *model_name = NULL;
+		const char *port = "8012";
+		const char *ctx_size = "8192";
+		int i;
+
+		/* parse flags */
+		for (i = 2; i < argc; i++) {
+			if ((strcmp(argv[i], "--port") == 0 ||
+			     strcmp(argv[i], "-p") == 0) && i + 1 < argc) {
+				port = argv[++i];
+			} else if (strcmp(argv[i], "--model") == 0 ||
+			           strcmp(argv[i], "-m") == 0) {
+				if (i + 1 < argc)
+					model_name = argv[++i];
+			} else if ((strcmp(argv[i], "--ctx-size") == 0 ||
+			            strcmp(argv[i], "-c") == 0) && i + 1 < argc) {
+				ctx_size = argv[++i];
+			} else if (argv[i][0] != '-') {
+				model_name = argv[i];
+			}
+		}
+
+		/* resolve model: arg > preferred_model */
+		char *preferred = NULL;
+		if (!model_name) {
+			preferred = kora_preferred_model();
+			model_name = preferred;
+		}
+
+		if (!model_name) {
+			fprintf(stderr, "kora: no model specified\n"
+				"Usage: kora serve [model] [--port PORT]\n");
+			db_close();
+			return 1;
+		}
+
+		char *model_path = resolve_model_path(model_name);
+		if (!model_path || !model_exists(model_path)) {
+			fprintf(stderr, "kora: model '%s' not found. "
+				"Use 'kora pull %s' to download it.\n",
+				model_name, model_name);
+			free(model_path);
+			free(preferred);
+			db_close();
+			return 1;
+		}
+
+		printf("Starting inference server on http://127.0.0.1:%s\n"
+		       "Model: %s\n", port, model_name);
+
+		db_close();
+		free(preferred);
+
+		/* find llama-server: next to kora binary, then PATH */
+		char self[512];
+		char server_path[512];
+		ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
+		if (len > 0) {
+			self[len] = '\0';
+			char *slash = strrchr(self, '/');
+			if (slash) {
+				*(slash + 1) = '\0';
+				snprintf(server_path, sizeof(server_path),
+					"%sllama-server", self);
+				if (access(server_path, X_OK) == 0) {
+					execl(server_path, "llama-server",
+					      "-m", model_path,
+					      "--host", "127.0.0.1",
+					      "--port", port,
+					      "--ctx-size", ctx_size,
+					      (char *)NULL);
+				}
+			}
+		}
+
+		/* fallback to PATH */
+		execlp("llama-server", "llama-server",
+		       "-m", model_path,
+		       "--host", "127.0.0.1",
+		       "--port", port,
+		       "--ctx-size", ctx_size,
+		       (char *)NULL);
+
+		/* exec failed */
+		fprintf(stderr, "kora: failed to start llama-server "
+			"(is it installed?)\n");
+		free(model_path);
+		return 1;
+	}
 
 	if (argc < 2 || strcmp(argv[1], "chat") == 0) {
 		/* load config */

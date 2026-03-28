@@ -1,4 +1,5 @@
 kora
+llama-server
 *.o
 src/core/schema_sql.h
 vendor/lua/src/lua
