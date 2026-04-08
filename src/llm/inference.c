@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "ggml.h"
 #include "inference.h"
+#include "chat_native.h"
 
 static uint64_t get_available_memory(void)
 {
@@ -134,12 +135,27 @@ struct kora_ctx *kora_load(const char *model_path, int n_ctx, int n_gpu_layers, 
 	/* sampler: temp -> top-p -> top-k -> repetition penalty */
 	struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
 	kc->sampler = llama_sampler_chain_init(sparams);
-	llama_sampler_chain_add(kc->sampler, llama_sampler_init_temp(0.7f));
-	llama_sampler_chain_add(kc->sampler, llama_sampler_init_top_p(0.9f, 1));
-	llama_sampler_chain_add(kc->sampler, llama_sampler_init_top_k(40));
-	llama_sampler_chain_add(kc->sampler, llama_sampler_init_dist(0));
+	/* IMPORTANT: sampler order matters. llama.cpp runs samplers in
+	   chain order. `dist` is the terminal sampler (picks the final
+	   token), so anything after it does nothing. penalties MUST come
+	   first so they modify logits before top_k/top_p/temp/dist sample.
+	   The previous order had penalties AFTER dist — they were a no-op,
+	   which let the model degenerate into pathological repetition
+	   loops on small/quantized models. */
 	llama_sampler_chain_add(kc->sampler, llama_sampler_init_penalties(
-		64, 1.1f, 0.0f, 0.0f));
+		256,    /* last_n: look back further to catch long-cycle loops */
+		1.15f,  /* repeat_penalty: stronger to break repetition */
+		0.0f,   /* frequency penalty */
+		0.0f)); /* presence penalty */
+	llama_sampler_chain_add(kc->sampler, llama_sampler_init_top_k(40));
+	llama_sampler_chain_add(kc->sampler, llama_sampler_init_top_p(0.9f, 1));
+	llama_sampler_chain_add(kc->sampler, llama_sampler_init_temp(0.7f));
+	llama_sampler_chain_add(kc->sampler, llama_sampler_init_dist(0));
+
+	/* probe native tool calling support: build a chat_templates handle
+	   and check if the format is anything other than CONTENT_ONLY. */
+	kc->native = kora_native_chat_create(kc->model);
+	kc->native_supports_tools = kc->native ? kora_native_chat_supports_tools(kc->native) : 0;
 
 	return kc;
 }
@@ -148,6 +164,8 @@ void kora_free(struct kora_ctx *kc)
 {
 	if (!kc)
 		return;
+	if (kc->native)
+		kora_native_chat_free(kc->native);
 	if (kc->sampler)
 		llama_sampler_free(kc->sampler);
 	if (kc->ctx)
@@ -301,12 +319,33 @@ void kora_set_stream_cb(kora_stream_cb cb, void *user_data)
 
 int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 {
+	/* always init *out so callers don't see uninitialized garbage on early
+	   return paths (decode failure, oversized prompt, oom, etc). */
+	if (out) *out = NULL;
+
 	const struct llama_vocab *vocab = llama_model_get_vocab(kc->model);
 
 	/* tokenize prompt */
 	int n_prompt = llama_tokenize(vocab, prompt, strlen(prompt), NULL, 0, true, true);
 	if (n_prompt < 0)
 		n_prompt = -n_prompt;
+
+	/* prompt-too-large check: if it doesn't leave room for at least a few
+	   tokens of output, we can't generate. surface this as a clean error
+	   instead of letting llama_decode crash internally. */
+	if (n_prompt >= kc->n_ctx - 16) {
+		fprintf(stderr, "kora: prompt %d tokens >= context %d (no room for output)\n",
+			n_prompt, kc->n_ctx);
+		if (out) {
+			char buf[256];
+			snprintf(buf, sizeof(buf),
+				"[error: prompt is %d tokens, context is %d. "
+				"Use /clear to reset the conversation.]",
+				n_prompt, kc->n_ctx);
+			*out = strdup(buf);
+		}
+		return -1;
+	}
 
 	llama_token *tokens = malloc(n_prompt * sizeof(llama_token));
 	if (!tokens)
@@ -325,6 +364,7 @@ int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 		if (llama_decode(kc->ctx, batch) != 0) {
 			fprintf(stderr, "kora: failed to decode prompt\n");
 			free(tokens);
+			if (out) *out = strdup("[error: failed to decode prompt]");
 			return -1;
 		}
 	}
@@ -341,9 +381,14 @@ int kora_generate(struct kora_ctx *kc, const char *prompt, char **out)
 		out_buf[0] = '\0';
 	}
 
-	/* generate tokens */
+	/* generate tokens.
+	   cap at 1024 tokens per call by default — even with proper repetition
+	   penalties, a degenerate model can fill the entire remaining context
+	   with garbage. 1024 is plenty for any reasonable response (~750
+	   words) and bounds the worst case to a few seconds on CPU. */
 	int n_gen = 0;
 	int n_max = kc->n_ctx - n_prompt;
+	if (n_max > 1024) n_max = 1024;
 	char piece[128];
 
 	while (n_gen < n_max) {

@@ -1,12 +1,16 @@
 #ifndef KORA_INFERENCE_H
 #define KORA_INFERENCE_H
 
+struct kora_native_chat;
+
 struct kora_ctx {
 	struct llama_model *model;
 	struct llama_context *ctx;
 	struct llama_sampler *sampler;
 	const char *chat_template;
 	int n_ctx;
+	struct kora_native_chat *native;  /* lazy-init handle for native tool calling */
+	int native_supports_tools;        /* probed at load time */
 };
 
 /* suppress llama.cpp log output */

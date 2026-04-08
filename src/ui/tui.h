@@ -49,6 +49,17 @@ char *tui_input(const char *prompt);
 /* clear and redraw the input box (e.g. after submitting a message) */
 void tui_input_clear(void);
 
+/* drain pending UI events (chunks, info, user/asst msgs) and render them.
+   call from a synchronous foreground loop (e.g. the agent loop) so that
+   queued events become visible without waiting for the next tui_input.
+   safe to call from the main thread only. */
+void tui_pump(void);
+
+/* temporarily suspend ncurses so an external program (e.g. $EDITOR) can
+   take over the terminal. call tui_resume() afterwards to reclaim it. */
+void tui_suspend(void);
+void tui_resume(void);
+
 /* get terminal dimensions */
 void tui_get_size(int *rows, int *cols);
 
@@ -59,8 +70,14 @@ void tui_draw_welcome(const char *model);
    shows shortcuts, mode info, or permission prompts */
 void tui_statusbar(const char *text);
 
-/* prompt the user for a yes/no/always decision in the status bar
-   returns 'y', 'n', or 'a' */
+/* prompt the user for a yes/no/always/quit decision in the status bar.
+   MAIN THREAD ONLY. blocks until the user answers. */
 int tui_permission(const char *prompt);
+
+/* same prompt, but callable from any thread. internally posts a request
+   that the main thread (via drain_events / tui_input poll) services by
+   calling tui_permission, then signals the caller. blocks the caller
+   until an answer is available. */
+int tui_request_permission(const char *prompt);
 
 #endif

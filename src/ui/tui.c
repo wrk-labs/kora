@@ -3,6 +3,7 @@
 #include <string.h>
 #include <signal.h>
 #include <locale.h>
+#include <pthread.h>
 #ifdef __APPLE__
 #include <ncurses.h>
 #else
@@ -75,6 +76,10 @@ static char *hist_saved = NULL;  /* saved current line when browsing history */
 
 /* multiline input state */
 static int input_h = INPUT_H_MIN;
+/* forward decls for cross-thread permission service (defined further down) */
+static int perm_pending;
+static void service_pending_permission(void);
+
 static int input_scroll = 0;  /* first visible line in multiline input */
 
 /* chat pad */
@@ -656,6 +661,10 @@ static void drain_events(void)
 	/* restore cursor to input box after rendering */
 	if (had_events || status_changed)
 		draw_input_box();
+
+	/* service any pending cross-thread permission request */
+	if (perm_pending)
+		service_pending_permission();
 }
 
 /* --- input helpers --- */
@@ -1052,6 +1061,74 @@ void tui_input_clear(void)
 	update_dynamic_statusbar();
 }
 
+void tui_pump(void)
+{
+	drain_events();
+}
+
+void tui_suspend(void)
+{
+	def_prog_mode();   /* save current ncurses state */
+	endwin();          /* leave ncurses, restore terminal */
+}
+
+void tui_resume(void)
+{
+	reset_prog_mode(); /* restore the saved ncurses state */
+	refresh();         /* repaint everything */
+	if (win_chat) wnoutrefresh(win_chat);
+	if (win_status) wnoutrefresh(win_status);
+	if (win_input) wnoutrefresh(win_input);
+	doupdate();
+}
+
+/* ===== cross-thread permission ============================================
+   The agent loop runs on a background thread but tui_permission must run on
+   the main thread (ncurses single-threaded; the main thread is also the
+   only one reading wgetch). So the agent thread parks a request in this
+   slot and waits on a condvar. The main thread, while polling in tui_input,
+   sees the pending request via drain_events, calls tui_permission(prompt)
+   synchronously, fills the answer, and signals the condvar. */
+
+static pthread_mutex_t perm_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  perm_cv    = PTHREAD_COND_INITIALIZER;
+static const char *perm_prompt = NULL;
+static int perm_answer = 0;
+static int perm_pending = 0;
+
+int tui_request_permission(const char *prompt)
+{
+	pthread_mutex_lock(&perm_mutex);
+	perm_prompt = prompt;
+	perm_pending = 1;
+	perm_answer = 0;
+	while (perm_pending)
+		pthread_cond_wait(&perm_cv, &perm_mutex);
+	int ans = perm_answer;
+	pthread_mutex_unlock(&perm_mutex);
+	return ans;
+}
+
+/* called from drain_events on the main thread when a request is pending */
+static void service_pending_permission(void)
+{
+	pthread_mutex_lock(&perm_mutex);
+	if (!perm_pending) {
+		pthread_mutex_unlock(&perm_mutex);
+		return;
+	}
+	const char *prompt = perm_prompt;
+	pthread_mutex_unlock(&perm_mutex);
+
+	int ans = tui_permission(prompt);  /* runs on main thread */
+
+	pthread_mutex_lock(&perm_mutex);
+	perm_answer = ans;
+	perm_pending = 0;
+	pthread_cond_broadcast(&perm_cv);
+	pthread_mutex_unlock(&perm_mutex);
+}
+
 int tui_permission(const char *prompt)
 {
 	int ch;
@@ -1064,18 +1141,29 @@ int tui_permission(const char *prompt)
 	mvwprintw(win_status, 0, 1, "%s", prompt);
 	wattroff(win_status, A_BOLD);
 	wattron(win_status, A_DIM);
-	wprintw(win_status, " [y/n/a] ");
+	wprintw(win_status, " [y]es / [n]o / [a]lways / [q]uit ");
 	wattroff(win_status, A_DIM);
 	wrefresh(win_status);
 
-	/* wait for y/n/a keypress */
+	/* enable keypad so arrow keys / function keys come through as KEY_*
+	   constants instead of raw ESC bytes (which would be misread as "no").
+	   also flush any stray input that arrived during model generation so
+	   accidental keypresses don't instantly answer for the user. */
+	keypad(win_status, TRUE);
+	flushinp();
+
+	/* wait for an explicit y/n/a/q keypress; ignore everything else.
+	   Ctrl-C still works as a deny shortcut. */
 	curs_set(0);
 	while (1) {
 		ch = wgetch(win_status);
+		if (ch == ERR) continue;
 		if (ch == 'y' || ch == 'Y') { ch = 'y'; break; }
 		if (ch == 'n' || ch == 'N') { ch = 'n'; break; }
 		if (ch == 'a' || ch == 'A') { ch = 'a'; break; }
-		if (ch == 27 || ch == 3)    { ch = 'n'; break; }  /* ESC or Ctrl-C = no */
+		if (ch == 'q' || ch == 'Q') { ch = 'q'; break; }
+		if (ch == 3)                { ch = 'n'; break; }  /* Ctrl-C = no */
+		/* ignore arrow keys, function keys, ESC, mouse, resize, etc */
 	}
 
 	/* restore normal statusbar */
@@ -1090,10 +1178,18 @@ void tui_tool_call(const char *name, const char *args)
 	chat_pad_ensure();
 	chat_scroll_bottom();
 
-	wattron(win_chat, A_DIM);
-	wprintw(win_chat, "  [%s]", name);
-	wattroff(win_chat, A_DIM);
-	wprintw(win_chat, " %s\n", args ? args : "");
+	/* render the tool name in bold so the user can immediately spot what
+	   the model is asking to run, and the args on the next line indented
+	   so they're scannable before any permission prompt fires. */
+	wattron(win_chat, A_BOLD);
+	wprintw(win_chat, "\n  ⚙ %s", name ? name : "(unknown)");
+	wattroff(win_chat, A_BOLD);
+	wprintw(win_chat, "\n");
+	if (args && *args) {
+		wattron(win_chat, A_DIM);
+		wprintw(win_chat, "    %s\n", args);
+		wattroff(win_chat, A_DIM);
+	}
 	refresh_chat();
 	draw_input_box();
 }

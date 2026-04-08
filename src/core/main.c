@@ -8,9 +8,11 @@
 #include "dispatch.h"
 #include "inference.h"
 #include "input.h"
+#include "loop.h"
 #include "lua_bridge.h"
 #include "model.h"
 #include "registry.h"
+#include "run.h"
 #include "status.h"
 #include "tui.h"
 #include "util.h"
@@ -85,6 +87,49 @@ static void null_stream_cb(const char *text, int len, void *user_data)
 
 static volatile int generating = 0;
 static char *gen_response = NULL;
+
+/* --- background agent loop (for kora code) --- */
+
+static volatile int agent_running = 0;
+static volatile int agent_cancel_flag = 0;
+static char *agent_result = NULL;
+static char *agent_err = NULL;
+static struct kora_run *agent_active_run = NULL;
+
+struct agent_args {
+	struct kora_run *run;
+	char *prompt;
+};
+
+static void *agent_thread_fn(void *arg)
+{
+	struct agent_args *aa = arg;
+	char *err = NULL;
+	char *result = kora_loop_run(aa->run, aa->prompt, &err);
+
+	/* publish results for the main thread to collect on its next iteration */
+	agent_result = result;
+	agent_err = err;
+
+	free(aa->prompt);
+	free(aa);
+	tui_statusbar(NULL);
+	agent_running = 0;
+	return NULL;
+}
+
+/* signal the agent loop to abort and wait for the thread to finish */
+static void agent_cancel(void)
+{
+	if (!agent_running)
+		return;
+	agent_cancel_flag = 1;
+	kora_abort();
+	while (agent_running) {
+		struct timespec ts = {0, 10000000};  /* 10ms */
+		nanosleep(&ts, NULL);
+	}
+}
 
 struct gen_args {
 	struct kora_ctx *kc;
@@ -190,6 +235,7 @@ struct switch_args {
 	int ctx_size;
 	int gpu_layers;
 	int threads;
+	int warm_index;   /* code mode: scan + cache the project index after load */
 };
 
 static void *switch_thread_fn(void *arg)
@@ -204,6 +250,15 @@ static void *switch_thread_fn(void *arg)
 	tui_statusbar(NULL);
 
 	if (new_kc) {
+		/* warm the project index BEFORE publishing the model so the user
+		   can't submit a prompt until the scan is cached. only one Lua-VM
+		   user at a time, and the agent thread can't exist yet. */
+		if (sa->warm_index) {
+			tui_statusbar("scanning project...");
+			tui_info("Scanning project...");
+			kora_lua_warm_index();
+			tui_statusbar(NULL);
+		}
 		switch_result = new_kc;
 		switch_model_name = sa->model_name;  /* transfer ownership */
 		char loaded_msg[256];
@@ -601,7 +656,7 @@ int main(int argc, char *argv[])
 
 		/* launch async model load if we have a valid path */
 		if (model_found) {
-			struct switch_args *sa = malloc(sizeof(*sa));
+			struct switch_args *sa = calloc(1, sizeof(*sa));
 			pthread_t switch_tid;
 			sa->model_name = strdup(model_name);
 			sa->model_path = model_path;  /* thread frees */
@@ -1003,7 +1058,7 @@ int main(int argc, char *argv[])
 						tui_info("Model not found. Use /pull to download it.");
 						free(new_path);
 					} else {
-						struct switch_args *sa = malloc(sizeof(*sa));
+						struct switch_args *sa = calloc(1, sizeof(*sa));
 						pthread_t switch_tid;
 						sa->model_name = strdup(new_name);
 						sa->model_path = new_path;  /* thread frees */
@@ -1176,8 +1231,428 @@ int main(int argc, char *argv[])
 	}
 
 	if (strcmp(argv[1], "code") == 0) {
-		printf("Code: not yet implemented\n");
-		return 1;
+		struct kora_config *cfg = kora_config_load(LUADIR);
+		struct kora_ctx *kc = NULL;
+		char *current_model = NULL;
+		const char *model_name = NULL;
+		char *preferred = NULL;
+		int i;
+
+		/* resolve model: arg > -m flag > preferred > code_model > default */
+		if (argc >= 3 && argv[2][0] != '-')
+			model_name = argv[2];
+		for (i = 2; i < argc - 1; i++) {
+			if (strcmp(argv[i], "-m") == 0)
+				model_name = argv[i + 1];
+		}
+		if (!model_name) {
+			preferred = kora_preferred_model();
+			if (preferred)
+				model_name = preferred;
+		}
+		if (!model_name && cfg->code_model)
+			model_name = cfg->code_model;
+		if (!model_name && cfg->default_model)
+			model_name = cfg->default_model;
+
+		kora_suppress_logs();
+
+		/* initialize the agent runtime (loads tools + agents from LUADIR) */
+		if (kora_lua_runtime_init(LUADIR) != 0) {
+			fprintf(stderr, "kora: failed to init agent runtime\n");
+			free(preferred);
+			kora_config_free(cfg);
+			db_close();
+			return 1;
+		}
+
+		/* resolve model path before entering TUI (mirrors chat mode) */
+		char *model_path = NULL;
+		int model_found = 0;
+		if (model_name) {
+			model_path = resolve_model_path(model_name);
+			if (model_path && model_exists(model_path))
+				model_found = 1;
+		}
+
+		/* enter TUI */
+		tui_init();
+		tui_set_header("kora code", model_found ? model_name : "no model");
+		tui_draw();
+		tui_draw_welcome(NULL);
+
+		/* launch async model load in background — same pattern as chat mode.
+		   the user can already see the prompt and start typing while the
+		   model loads. switch_thread_fn handles the actual kora_load and
+		   posts results via switch_result / switching_model. */
+		if (model_found) {
+			struct switch_args *sa = calloc(1, sizeof(*sa));
+			pthread_t switch_tid;
+			sa->model_name = strdup(model_name);
+			sa->model_path = model_path;  /* thread frees */
+			sa->ctx_size = cfg->ctx_size;
+			sa->gpu_layers = cfg->gpu_layers;
+			sa->threads = cfg->threads;
+			sa->warm_index = 1;  /* code mode: scan project after model load */
+			switching_model = 1;
+			tui_info("");
+			tui_info("Loading model...");
+			pthread_create(&switch_tid, NULL, switch_thread_fn, sa);
+			pthread_detach(switch_tid);
+		} else {
+			free(model_path);
+			if (model_name) {
+				char msg[256];
+				snprintf(msg, sizeof(msg), "Model '%s' not found.", model_name);
+				tui_info(msg);
+			}
+			tui_info("No model specified. Pass one as 'kora code <model>' or set code_model in ~/.kora/config.lua.");
+		}
+		free(preferred);
+		preferred = NULL;
+
+		int running = 1;
+		while (running) {
+			char *input = tui_input("> ");
+
+			/* collect completed background tasks at the top of each iteration —
+			   mirrors chat mode's pattern. tui_input has been draining events
+			   the whole time the agent thread was running. */
+
+			/* collect completed model load */
+			if (!switching_model && switch_result) {
+				if (kc) kora_free(kc);
+				kc = switch_result;
+				switch_result = NULL;
+				free(current_model);
+				current_model = switch_model_name;
+				model_name = current_model;
+				switch_model_name = NULL;
+				kora_set_preferred_model(model_name);
+				tui_set_header("kora code", model_name);
+
+				/* allocate the persistent run for this session.
+				   it lives until /clear or /exit, accumulating message
+				   history across user prompts (matching chat mode). */
+				if (!agent_active_run) {
+					agent_active_run = kora_run_new(kc, &agent_cancel_flag, NULL);
+					agent_active_run->agent_name = "code";
+				}
+			}
+
+			/* collect completed agent run output (but DON'T free the run —
+			   it persists across user messages) */
+			if (!agent_running && (agent_result || agent_err)) {
+				if (agent_err) {
+					tui_info(agent_err);
+					free(agent_err);
+					agent_err = NULL;
+				}
+				free(agent_result);
+				agent_result = NULL;
+			}
+
+			if (!input)
+				break;
+
+			/* ESC during generation: empty input + agent_running → cancel */
+			if (input[0] == '\0') {
+				if (agent_running)
+					agent_cancel();
+				free(input);
+				continue;
+			}
+
+			if (strcmp(input, "/exit") == 0 || strcmp(input, "/quit") == 0 ||
+			    strcmp(input, "exit") == 0 || strcmp(input, "quit") == 0) {
+				free(input);
+				break;
+			}
+
+			/* slash commands */
+			if (strcmp(input, "/help") == 0) {
+				tui_info("/help                Show this message");
+				tui_info("/model               List models / show current");
+				tui_info("/model <name>        Switch to a different model");
+				tui_info("/pull <name|url>     Download a model");
+				tui_info("/clear               Clear conversation history (start fresh)");
+				tui_info("/reload              Reload Lua agents/tools (no restart)");
+				tui_info("/debug               Open debug dump (state + system prompt + log) in $EDITOR");
+				tui_info("/exit                Quit");
+				tui_info("");
+				tui_info("Press ESC during generation to cancel.");
+				free(input);
+				continue;
+			}
+			if (strcmp(input, "/clear") == 0) {
+				if (agent_running) {
+					tui_info("Cannot clear while agent is running. Press ESC first.");
+				} else {
+					if (agent_active_run) {
+						kora_run_free(agent_active_run);
+						agent_active_run = NULL;
+					}
+					if (kc) {
+						agent_active_run = kora_run_new(kc, &agent_cancel_flag, NULL);
+						agent_active_run->agent_name = "code";
+					}
+					tui_draw();
+					tui_draw_welcome(kc ? model_name : NULL);
+					tui_info("Conversation cleared.");
+				}
+				free(input);
+				continue;
+			}
+			if (strncmp(input, "/model", 6) == 0 &&
+			    (input[6] == '\0' || input[6] == ' ')) {
+				const char *new_name = input + 6;
+				while (*new_name == ' ') new_name++;
+				if (*new_name == '\0') {
+					char model_msg[256];
+					snprintf(model_msg, sizeof(model_msg),
+						"Current model: %s",
+						model_name ? model_name : "(none)");
+					tui_info(model_msg);
+					tui_info("");
+					tui_info("  Models:");
+					tui_info("  ──────────────────────────────────────────────────────────");
+					db_models_each(tui_model_table_cb, NULL);
+				} else if (!valid_model_name(new_name)) {
+					tui_info("Invalid model name.");
+				} else if (agent_running || switching_model) {
+					tui_info("Busy. Press ESC to cancel current task first.");
+				} else {
+					char *new_path = resolve_model_path(new_name);
+					if (!new_path) {
+						tui_info("Could not resolve model.");
+					} else if (!model_exists(new_path)) {
+						tui_info("Model not found. Use /pull to download it.");
+						free(new_path);
+					} else {
+						struct switch_args *sa = calloc(1, sizeof(*sa));
+						pthread_t switch_tid;
+						sa->model_name = strdup(new_name);
+						sa->model_path = new_path;  /* thread frees */
+						sa->ctx_size = cfg->ctx_size;
+						sa->gpu_layers = cfg->gpu_layers;
+						sa->threads = cfg->threads;
+						/* don't re-warm: same cwd, cached project still valid */
+						sa->warm_index = 0;
+						switching_model = 1;
+						tui_info("Loading model...");
+						pthread_create(&switch_tid, NULL, switch_thread_fn, sa);
+						pthread_detach(switch_tid);
+					}
+				}
+				free(input);
+				continue;
+			}
+			if (strncmp(input, "/pull", 5) == 0 &&
+			    (input[5] == '\0' || input[5] == ' ')) {
+				const char *target = input + 5;
+				while (*target == ' ') target++;
+				if (*target == '\0') {
+					tui_info("Usage: /pull <model|url>");
+				} else if (!valid_pull_target(target)) {
+					tui_info("Invalid target. Use a model name or https:// URL.");
+				} else if (dispatch_active()) {
+					tui_info("A background task is already running.");
+				} else {
+					struct pull_args *pa = malloc(sizeof(*pa));
+					snprintf(pa->target, sizeof(pa->target), "%s", target);
+					char pull_msg[256];
+					snprintf(pull_msg, sizeof(pull_msg),
+						"Downloading %s in background...", target);
+					tui_info(pull_msg);
+					dispatch(bg_pull_fn, pa);
+				}
+				free(input);
+				continue;
+			}
+			if (strcmp(input, "/debug") == 0) {
+				/* dump current state to a tmp file and open in $EDITOR.
+				   sections: meta, system prompt that would be sent next,
+				   tail of ~/.kora/code.log so the user can see what's
+				   actually happening under the hood. */
+				char tmppath[256];
+				snprintf(tmppath, sizeof(tmppath), "/tmp/kora-debug.%d.md", (int)getpid());
+				FILE *df = fopen(tmppath, "w");
+				if (!df) {
+					tui_info("Failed to create debug dump file.");
+					free(input);
+					continue;
+				}
+
+				fprintf(df, "# kora debug dump\n\n");
+				fprintf(df, "## State\n\n");
+				fprintf(df, "- model: %s\n", model_name ? model_name : "(none)");
+				char *cwd_buf = getcwd(NULL, 0);
+				fprintf(df, "- cwd: %s\n", cwd_buf ? cwd_buf : "?");
+				free(cwd_buf);
+				fprintf(df, "- agent: code\n");
+				fprintf(df, "- agent_running: %d\n", agent_running);
+				fprintf(df, "- switching_model: %d\n", switching_model);
+				fprintf(df, "\n");
+
+				fprintf(df, "## System prompt (next turn would use this)\n\n");
+				const char *dbg_mode = (kc && kc->native_supports_tools) ? "native" : "harness";
+				fprintf(df, "_mode: %s_\n\n", dbg_mode);
+				char *sp = kora_lua_build_system_prompt("code", dbg_mode);
+				if (sp) {
+					fprintf(df, "```\n%s\n```\n\n", sp);
+					free(sp);
+				} else {
+					fprintf(df, "(failed to build)\n\n");
+				}
+
+				/* tail the code.log: last 400 lines */
+				fprintf(df, "## Recent log (~/.kora/code.log, last 400 lines)\n\n");
+				fprintf(df, "```\n");
+				char *logpath = kora_path("code.log");
+				if (logpath) {
+					FILE *lf = fopen(logpath, "r");
+					if (lf) {
+						/* count lines, then seek */
+						int total = 0;
+						int c;
+						while ((c = fgetc(lf)) != EOF)
+							if (c == '\n') total++;
+						rewind(lf);
+						int skip = total > 400 ? total - 400 : 0;
+						int seen = 0;
+						while ((c = fgetc(lf)) != EOF) {
+							if (seen >= skip)
+								fputc(c, df);
+							if (c == '\n') seen++;
+						}
+						fclose(lf);
+					} else {
+						fprintf(df, "(no log file at %s)\n", logpath);
+					}
+					free(logpath);
+				}
+				fprintf(df, "\n```\n");
+				fclose(df);
+
+				const char *editor = getenv("EDITOR");
+				if (!editor || !*editor) editor = "vim";
+				char cmd[512];
+				snprintf(cmd, sizeof(cmd), "%s %s", editor, tmppath);
+
+				tui_suspend();
+				int rc = system(cmd);
+				tui_resume();
+				(void)rc;
+
+				unlink(tmppath);
+				free(input);
+				continue;
+			}
+			if (strcmp(input, "/reload") == 0) {
+				if (agent_running) {
+					tui_info("Cannot reload while agent is running.");
+				} else {
+					kora_lua_runtime_free();
+					if (kora_lua_runtime_init(LUADIR) == 0) {
+						/* re-warm the index since we threw out the cache */
+						kora_lua_warm_index();
+						/* rebuild the run so the new system prompt
+						   actually takes effect (the existing run still
+						   has the OLD system message at index 0) */
+						if (agent_active_run) {
+							kora_run_free(agent_active_run);
+							agent_active_run = NULL;
+						}
+						if (kc) {
+							agent_active_run = kora_run_new(kc, &agent_cancel_flag, NULL);
+							agent_active_run->agent_name = "code";
+						}
+						tui_info("Lua runtime reloaded (agents, tools, project index, conversation reset).");
+					} else {
+						tui_info("Lua runtime reload FAILED. Restart kora.");
+					}
+				}
+				free(input);
+				continue;
+			}
+			if (input[0] == '/') {
+				char err_msg[256];
+				snprintf(err_msg, sizeof(err_msg),
+					"Unknown command: %s (type /help)", input);
+				tui_info(err_msg);
+				free(input);
+				continue;
+			}
+
+			if (!kc) {
+				tui_info("Model is still loading. Please wait.");
+				free(input);
+				continue;
+			}
+
+			if (agent_running) {
+				tui_info("Agent is busy. Press ESC to cancel first.");
+				free(input);
+				continue;
+			}
+
+			tui_user_msg(input);
+			tui_input_clear();
+
+			/* launch agent loop in a background thread so the main thread
+			   stays in tui_input draining events at 60fps. the run is
+			   shared and persists across user messages — kora_loop_run
+			   appends to its existing message history, gives the model
+			   real conversation memory (mirrors chat mode and plaza). */
+			agent_cancel_flag = 0;
+			if (!agent_active_run) {
+				agent_active_run = kora_run_new(kc, &agent_cancel_flag, NULL);
+				agent_active_run->agent_name = "code";
+			}
+
+			struct agent_args *aa = malloc(sizeof(*aa));
+			aa->run = agent_active_run;  /* shared, NOT owned by the thread */
+			aa->prompt = input;          /* thread frees */
+			input = NULL;
+
+			pthread_t agent_tid;
+			agent_running = 1;
+			agent_result = NULL;
+			agent_err = NULL;
+			tui_statusbar("agent running... (esc to cancel)");
+			pthread_create(&agent_tid, NULL, agent_thread_fn, aa);
+			pthread_detach(agent_tid);
+		}
+
+		/* wait for any in-flight tasks before tearing down */
+		agent_cancel();
+		while (switching_model) {
+			struct timespec ts = {0, 50000000};
+			nanosleep(&ts, NULL);
+		}
+		if (switch_result) {
+			if (kc) kora_free(kc);
+			kc = switch_result;
+			switch_result = NULL;
+		}
+		free(switch_model_name);
+		switch_model_name = NULL;
+		if (agent_active_run) {
+			kora_run_free(agent_active_run);
+			agent_active_run = NULL;
+		}
+		free(agent_result);
+		agent_result = NULL;
+		free(agent_err);
+		agent_err = NULL;
+
+		tui_cleanup();
+		if (kc) kora_free(kc);
+		kora_lua_runtime_free();
+		free(current_model);
+		kora_config_free(cfg);
+		db_close();
+		return 0;
 	}
 
 	fprintf(stderr, "kora: unknown command '%s'\n", argv[1]);

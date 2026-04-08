@@ -6,3 +6,4 @@ vendor/lua/src/lua
 vendor/lua/src/luac
 vendor/lua/src/liblua.a
 vendor/llama.cpp/build/
+tests/c/test_parser
