@@ -7,6 +7,11 @@
 #include <sstream>
 #include <string>
 
+/* double-stop guard: httplib::Server::stop() asserts if svr_sock_ has already
+   been reset by a prior stop(). we can get two stop() calls from ^C^C or a
+   racey signal path; this flag makes the second call a no-op. */
+static std::atomic<bool> g_stopped{false};
+
 #include "httplib.h"
 
 extern "C" {
@@ -273,6 +278,7 @@ void proxy_request(const httplib::Request &req, httplib::Response &res)
 
 extern "C" int kora_proxy_listen(int port)
 {
+	g_stopped.store(false);
 	{
 		std::lock_guard<std::mutex> lk(g_srv_mu);
 		g_srv = new httplib::Server();
@@ -300,6 +306,7 @@ extern "C" int kora_proxy_listen(int port)
 
 extern "C" void kora_proxy_stop(void)
 {
+	if (g_stopped.exchange(true)) return;
 	std::lock_guard<std::mutex> lk(g_srv_mu);
-	if (g_srv) g_srv->stop();
+	if (g_srv && g_srv->is_running()) g_srv->stop();
 }

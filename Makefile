@@ -5,7 +5,7 @@ UNAME_S := $(shell uname -s)
 
 SRC_C = src/core/main.c src/core/util.c src/core/db.c src/core/dispatch.c \
         src/core/config.c \
-        src/llm/inference.c src/llm/model.c src/llm/registry.c \
+        src/llm/client.c src/llm/model.c src/llm/registry.c \
         src/server/server.c src/server/pool.c \
         src/ui/tui.c src/ui/input.c src/ui/event.c src/ui/status.c
 
@@ -18,21 +18,11 @@ OBJ = $(SRC_C:.c=.o) $(SRC_CXX:.cc=.o) $(HTTPLIB_OBJ)
 BIN = kora
 
 LLAMA_BUILD = vendor/llama.cpp/build
-LLAMA_LIB = $(LLAMA_BUILD)/src/libllama.a
-COMMON_LIB = $(LLAMA_BUILD)/common/libcommon.a
 LLAMA_SERVER = $(LLAMA_BUILD)/bin/llama-server
-GGML_LIBS = $(LLAMA_BUILD)/ggml/src/libggml.a \
-            $(LLAMA_BUILD)/ggml/src/libggml-base.a \
-            $(LLAMA_BUILD)/ggml/src/libggml-cpu.a \
-            $(wildcard $(LLAMA_BUILD)/ggml/src/ggml-metal/libggml-metal.a) \
-            $(wildcard $(LLAMA_BUILD)/ggml/src/ggml-blas/libggml-blas.a)
 
 LUA_LIB = vendor/lua/src/liblua.a
 
 CFLAGS += -DVERSION=\"$(VERSION)\" -DLUADIR=\"$(LUADIR)\"
-CFLAGS += -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include
-CFLAGS += -Ivendor/llama.cpp -Ivendor/llama.cpp/common
-CFLAGS += -Ivendor/llama.cpp/vendor
 CFLAGS += -Ivendor/lua/src
 CFLAGS += -Isrc/core -Isrc/llm -Isrc/server -Isrc/ui
 CFLAGS += -Ivendor/llama.cpp/vendor/cpp-httplib
@@ -51,11 +41,11 @@ ifeq ($(UNAME_S),Darwin)
   else
     NCURSES_LIB = -lncurses
   endif
-  PLATFORM_LIBS = -lm -lpthread $(NCURSES_LIB) -lsqlite3 -framework Accelerate -framework Metal -framework Foundation
+  PLATFORM_LIBS = -lm -lpthread $(NCURSES_LIB) -lsqlite3 -lcurl
 else
   NPROC := $(shell nproc)
   LUA_PLATFORM = linux
-  PLATFORM_LIBS = -lm -ldl -lpthread -lstdc++ -lgomp -lncursesw -lsqlite3
+  PLATFORM_LIBS = -lm -lpthread -lstdc++ -lncursesw -lsqlite3 -lcurl
 endif
 
 # default target
@@ -73,7 +63,9 @@ $(SCHEMA_HDR): src/sql/schema.sql
 src/core/db.o: $(SCHEMA_HDR)
 
 # --- vendor libs ---
-$(LLAMA_LIB) $(LLAMA_SERVER):
+# kora links against liblua (for config) but NOT libllama. llama-server is
+# a separate binary that the supervisor execs.
+$(LLAMA_SERVER):
 	cmake -S vendor/llama.cpp -B $(LLAMA_BUILD) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DLLAMA_BUILD_TESTS=OFF \
@@ -83,14 +75,16 @@ $(LLAMA_LIB) $(LLAMA_SERVER):
 		-DLLAMA_BUILD_SERVER=ON \
 		-DBUILD_SHARED_LIBS=OFF \
 		$(LLAMA_CMAKE_FLAGS)
-	cmake --build $(LLAMA_BUILD) --config Release -j$(NPROC)
+	cmake --build $(LLAMA_BUILD) --config Release -j$(NPROC) --target llama-server
 
 $(LUA_LIB):
 	$(MAKE) -C vendor/lua $(LUA_PLATFORM)
 
 # --- kora binary ---
-$(BIN): $(OBJ) $(LLAMA_LIB) $(LUA_LIB)
-	$(CXX) -o $@ $(OBJ) $(COMMON_LIB) $(LLAMA_LIB) $(GGML_LIBS) $(LUA_LIB) $(LDFLAGS) $(PLATFORM_LIBS)
+# kora needs llama-server at ./llama-server (next to it) for the supervisor to
+# exec, so force-build the dep and fail loud if the copy fails.
+$(BIN): $(OBJ) $(LUA_LIB) $(LLAMA_SERVER)
+	$(CXX) -o $@ $(OBJ) $(LUA_LIB) $(LDFLAGS) $(PLATFORM_LIBS)
 	cp -f $(LLAMA_SERVER) ./llama-server
 
 %.o: %.c
