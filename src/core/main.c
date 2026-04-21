@@ -11,6 +11,7 @@
 #include "input.h"
 #include "model.h"
 #include "registry.h"
+#include "server.h"
 #include "status.h"
 #include "tui.h"
 #include "util.h"
@@ -465,94 +466,49 @@ int main(int argc, char *argv[])
 	}
 
 	if (argc >= 2 && strcmp(argv[1], "serve") == 0) {
-		const char *model_name = NULL;
-		const char *port = "8012";
-		const char *ctx_size = "8192";
+		struct kora_server_opts opts = {
+			.model             = NULL,
+			.public_port       = 8818,
+			.ctx_size          = 8192,
+			.idle_timeout_secs = 0,
+		};
 		int i;
 
-		/* parse flags */
 		for (i = 2; i < argc; i++) {
 			if ((strcmp(argv[i], "--port") == 0 ||
 			     strcmp(argv[i], "-p") == 0) && i + 1 < argc) {
-				port = argv[++i];
-			} else if (strcmp(argv[i], "--model") == 0 ||
-			           strcmp(argv[i], "-m") == 0) {
-				if (i + 1 < argc)
-					model_name = argv[++i];
+				opts.public_port = atoi(argv[++i]);
+			} else if ((strcmp(argv[i], "--model") == 0 ||
+			            strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
+				opts.model = argv[++i];
 			} else if ((strcmp(argv[i], "--ctx-size") == 0 ||
 			            strcmp(argv[i], "-c") == 0) && i + 1 < argc) {
-				ctx_size = argv[++i];
+				opts.ctx_size = atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--idle-timeout") == 0 &&
+			           i + 1 < argc) {
+				opts.idle_timeout_secs = atoi(argv[++i]);
 			} else if (argv[i][0] != '-') {
-				model_name = argv[i];
+				opts.model = argv[i];
 			}
 		}
 
-		/* resolve model: arg > preferred_model */
 		char *preferred = NULL;
-		if (!model_name) {
+		if (!opts.model) {
 			preferred = kora_preferred_model();
-			model_name = preferred;
+			opts.model = preferred;
 		}
-
-		if (!model_name) {
+		if (!opts.model) {
 			fprintf(stderr, "kora: no model specified\n"
-				"Usage: kora serve [model] [--port PORT]\n");
+				"Usage: kora serve [model] [--port PORT] "
+				"[--ctx-size N] [--idle-timeout SECS]\n");
 			db_close();
 			return 1;
 		}
-
-		char *model_path = resolve_model_path(model_name);
-		if (!model_path || !model_exists(model_path)) {
-			fprintf(stderr, "kora: model '%s' not found. "
-				"Use 'kora pull %s' to download it.\n",
-				model_name, model_name);
-			free(model_path);
-			free(preferred);
-			db_close();
-			return 1;
-		}
-
-		printf("Starting inference server on http://127.0.0.1:%s\n"
-		       "Model: %s\n", port, model_name);
 
 		db_close();
+		int rc = kora_server_run(&opts);
 		free(preferred);
-
-		/* find llama-server: next to kora binary, then PATH */
-		char self[256];
-		char server_path[280];
-		ssize_t len = readlink("/proc/self/exe", self, sizeof(self) - 1);
-		if (len > 0 && len < (ssize_t)sizeof(self) - 1) {
-			self[len] = '\0';
-			char *slash = strrchr(self, '/');
-			if (slash && (size_t)(slash - self + 1) + 13 < sizeof(server_path)) {
-				*(slash + 1) = '\0';
-				snprintf(server_path, sizeof(server_path),
-					"%s%s", self, "llama-server");
-				if (access(server_path, X_OK) == 0) {
-					execl(server_path, "llama-server",
-					      "-m", model_path,
-					      "--host", "127.0.0.1",
-					      "--port", port,
-					      "--ctx-size", ctx_size,
-					      (char *)NULL);
-				}
-			}
-		}
-
-		/* fallback to PATH */
-		execlp("llama-server", "llama-server",
-		       "-m", model_path,
-		       "--host", "127.0.0.1",
-		       "--port", port,
-		       "--ctx-size", ctx_size,
-		       (char *)NULL);
-
-		/* exec failed */
-		fprintf(stderr, "kora: failed to start llama-server "
-			"(is it installed?)\n");
-		free(model_path);
-		return 1;
+		return rc;
 	}
 
 	if (argc < 2 || strcmp(argv[1], "chat") == 0) {

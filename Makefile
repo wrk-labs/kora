@@ -6,9 +6,15 @@ UNAME_S := $(shell uname -s)
 SRC_C = src/core/main.c src/core/util.c src/core/db.c src/core/dispatch.c \
         src/core/config.c \
         src/llm/inference.c src/llm/model.c src/llm/registry.c \
+        src/server/server.c src/server/child.c \
         src/ui/tui.c src/ui/input.c src/ui/event.c src/ui/status.c
 
-OBJ = $(SRC_C:.c=.o)
+SRC_CXX = src/server/proxy.cc
+
+HTTPLIB_SRC = vendor/llama.cpp/vendor/cpp-httplib/httplib.cpp
+HTTPLIB_OBJ = $(HTTPLIB_SRC:.cpp=.o)
+
+OBJ = $(SRC_C:.c=.o) $(SRC_CXX:.cc=.o) $(HTTPLIB_OBJ)
 BIN = kora
 
 LLAMA_BUILD = vendor/llama.cpp/build
@@ -28,7 +34,10 @@ CFLAGS += -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include
 CFLAGS += -Ivendor/llama.cpp -Ivendor/llama.cpp/common
 CFLAGS += -Ivendor/llama.cpp/vendor
 CFLAGS += -Ivendor/lua/src
-CFLAGS += -Isrc/core -Isrc/llm -Isrc/ui
+CFLAGS += -Isrc/core -Isrc/llm -Isrc/server -Isrc/ui
+CFLAGS += -Ivendor/llama.cpp/vendor/cpp-httplib
+
+CXXFLAGS += $(CFLAGS) -std=c++17
 
 ifeq ($(UNAME_S),Darwin)
   NPROC := $(shell sysctl -n hw.ncpu)
@@ -86,6 +95,12 @@ $(BIN): $(OBJ) $(LLAMA_LIB) $(LUA_LIB)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.cc
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(HTTPLIB_OBJ): $(HTTPLIB_SRC)
+	$(CXX) $(CXXFLAGS) -w -c $< -o $@
 
 clean:
 	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
