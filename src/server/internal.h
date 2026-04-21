@@ -5,23 +5,41 @@
 extern "C" {
 #endif
 
-/* --- request bookkeeping (server.c) --- */
+/* --- pool (pool.c) --- */
 
-void kora_server_begin_request(void);
-void kora_server_end_request(void);
+struct kora_pool_snap {
+	char model[128];
+	int  port;
+	int  pid;
+	int  in_flight;
+	int  idle_secs;
+	int  loading;
+};
 
-/* --- child lifecycle (child.c) --- */
+void kora_pool_init(int cap, int ctx_size, int parallel);
+void kora_pool_set_default_model(const char *model);
+const char *kora_pool_default_model(void);
 
-void kora_child_init(int ctx_size);
-void kora_child_set_default_model(const char *model);
+/* ensures a child is running for `requested` (or the default if NULL/empty).
+   on success: returns the internal port and writes the pool slot index into
+   *out_slot. bumps in_flight; caller MUST call kora_pool_release(slot)
+   exactly once when done. returns -1 on failure. */
+int  kora_pool_ensure_ready(const char *requested, int *out_slot);
 
-/* returns the internal port of a running child serving `requested` (or the
-   configured default if requested is NULL/empty), spawning on miss. blocks
-   during spawn + health check. thread-safe. returns -1 on failure. */
-int kora_child_ensure_ready(const char *requested);
+void kora_pool_release(int slot);
 
-void kora_child_stop(void);
-int  kora_child_is_running(void);
+int  kora_pool_is_any_running(void);
+void kora_pool_idle_check(int timeout_secs);
+void kora_pool_stop_all(void);
+
+/* admin: returns 0 on success, -1 if not loaded, -2 if busy */
+int  kora_pool_unload(const char *model);
+
+/* snapshot for admin/status */
+int  kora_pool_snapshot(struct kora_pool_snap *out, int cap);
+int  kora_pool_cap(void);
+int  kora_pool_ctx_size(void);
+int  kora_pool_parallel(void);
 
 /* --- proxy (proxy.cc) --- */
 

@@ -6,7 +6,7 @@ UNAME_S := $(shell uname -s)
 SRC_C = src/core/main.c src/core/util.c src/core/db.c src/core/dispatch.c \
         src/core/config.c \
         src/llm/inference.c src/llm/model.c src/llm/registry.c \
-        src/server/server.c src/server/child.c \
+        src/server/server.c src/server/pool.c \
         src/ui/tui.c src/ui/input.c src/ui/event.c src/ui/status.c
 
 SRC_CXX = src/server/proxy.cc

@@ -471,6 +471,8 @@ int main(int argc, char *argv[])
 			.public_port       = 8818,
 			.ctx_size          = 8192,
 			.idle_timeout_secs = 0,
+			.pool_size         = 2,
+			.parallel          = 1,
 		};
 		int i;
 
@@ -487,6 +489,12 @@ int main(int argc, char *argv[])
 			} else if (strcmp(argv[i], "--idle-timeout") == 0 &&
 			           i + 1 < argc) {
 				opts.idle_timeout_secs = atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--pool-size") == 0 &&
+			           i + 1 < argc) {
+				opts.pool_size = atoi(argv[++i]);
+			} else if (strcmp(argv[i], "--parallel") == 0 &&
+			           i + 1 < argc) {
+				opts.parallel = atoi(argv[++i]);
 			} else if (argv[i][0] != '-') {
 				opts.model = argv[i];
 			}
@@ -500,7 +508,8 @@ int main(int argc, char *argv[])
 		if (!opts.model) {
 			fprintf(stderr, "kora: no model specified\n"
 				"Usage: kora serve [model] [--port PORT] "
-				"[--ctx-size N] [--idle-timeout SECS]\n");
+				"[--ctx-size N] [--idle-timeout SECS] "
+				"[--pool-size N] [--parallel N]\n");
 			db_close();
 			return 1;
 		}

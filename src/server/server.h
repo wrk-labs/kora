@@ -6,6 +6,8 @@ struct kora_server_opts {
 	int         public_port;        /* 0 → 8818 */
 	int         ctx_size;           /* 0 → 8192 */
 	int         idle_timeout_secs;  /* 0 → never unload */
+	int         pool_size;          /* 0 → 2 (max simultaneous resident models) */
+	int         parallel;           /* 0 → 1 (per-model llama-server slots) */
 };
 
 /* run the supervisor. binds public_port, lazy-spawns llama-server as a
