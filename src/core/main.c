@@ -13,6 +13,7 @@
 #include "model.h"
 #include "registry.h"
 #include "server.h"
+#include "session.h"
 #include "status.h"
 #include "tui.h"
 #include "util.h"
@@ -95,33 +96,9 @@ static char *gen_response = NULL;
 struct gen_args {
 	char *base_url;
 	char *model;
-	struct kora_message *msgs;   /* deep-copied; thread frees */
+	struct kora_message *msgs;   /* snapshot from kora_session_snapshot */
 	int n_msgs;
 };
-
-static void free_msgs(struct kora_message *msgs, int n)
-{
-	for (int i = 0; i < n; i++) {
-		free((char *)msgs[i].role);
-		free((char *)msgs[i].content);
-	}
-	free(msgs);
-}
-
-static struct kora_message *dup_msgs(const char **roles, const char **contents, int n)
-{
-	struct kora_message *msgs = calloc((size_t)n, sizeof(*msgs));
-	if (!msgs) return NULL;
-	for (int i = 0; i < n; i++) {
-		msgs[i].role = strdup(roles[i]);
-		msgs[i].content = strdup(contents[i]);
-		if (!msgs[i].role || !msgs[i].content) {
-			free_msgs(msgs, n);
-			return NULL;
-		}
-	}
-	return msgs;
-}
 
 static void *gen_thread_fn(void *arg)
 {
@@ -141,8 +118,6 @@ static void *gen_thread_fn(void *arg)
 	char *response = NULL;
 	int rc = kora_client_chat(&opts, &response);
 
-	/* if streaming produced nothing but the request failed, render the error
-	   inline so the user sees something instead of an empty assistant block */
 	if (rc != 0 && (!response || !*response)) {
 		free(response);
 		const char *err = "[error: chat request failed. is 'kora serve' running?]";
@@ -154,7 +129,7 @@ static void *gen_thread_fn(void *arg)
 	tui_statusbar(NULL);
 	gen_response = response;
 
-	free_msgs(ga->msgs, ga->n_msgs);
+	kora_session_snapshot_free(ga->msgs, ga->n_msgs);
 	free(ga->base_url);
 	free(ga->model);
 	free(ga);
@@ -182,7 +157,7 @@ static int compact_before = 0;
 struct compact_args {
 	char *base_url;
 	char *model;
-	char *conversation;   /* "role: content\n..." */
+	char *conversation;
 	char *compact_prompt;
 	int before_tokens;
 };
@@ -212,7 +187,7 @@ static void *compact_thread_fn(void *arg)
 	if (rc == 0 && summary && *summary) {
 		compact_summary = summary;
 		compact_before = ca->before_tokens;
-		int after = (int)(strlen(summary) / 4);  /* approx */
+		int after = (int)(strlen(summary) / 4);
 		char msg[128];
 		snprintf(msg, sizeof msg, "Compacted: ~%d -> ~%d tokens",
 		         ca->before_tokens, after);
@@ -329,30 +304,21 @@ static int valid_pull_target(const char *target)
 	return valid_model_name(target);
 }
 
-/* approximate total tokens across messages (chars/4). fast, local, no HTTP. */
-static int approx_tokens(const char **roles, const char **contents, int n_msg)
+static int ctx_needs_compression(int tokens, int ctx_size)
 {
-	size_t bytes = 0;
-	for (int i = 0; i < n_msg; i++)
-		bytes += strlen(roles[i]) + strlen(contents[i]) + 8;  /* framing overhead */
-	return (int)(bytes / 4);
+	return ctx_size > 0 && tokens > (int)(ctx_size * 0.75);
 }
 
-static int ctx_needs_compression(int approx, int ctx_size)
+static void update_context_status(const struct kora_session *session, int ctx_size)
 {
-	return ctx_size > 0 && approx > (int)(ctx_size * 0.75);
-}
-
-static void update_context_status(int approx_tokens_used, int ctx_size)
-{
+	int tokens = kora_session_approx_tokens(session);
 	if (ctx_size <= 0) {
 		status_set(STATUS_CONTEXT, "/help for commands");
 		return;
 	}
 	char buf[128];
-	int pct = (int)((double)approx_tokens_used / ctx_size * 100);
-	snprintf(buf, sizeof buf, "~%d/%d tokens (%d%%)",
-	         approx_tokens_used, ctx_size, pct);
+	int pct = (int)((double)tokens / ctx_size * 100);
+	snprintf(buf, sizeof buf, "~%d/%d tokens (%d%%)", tokens, ctx_size, pct);
 	status_set(STATUS_CONTEXT, buf);
 }
 
@@ -374,7 +340,6 @@ static void version(void)
 	printf("kora %s\n", VERSION);
 }
 
-/* resolve a model alias to a file path under ~/.kora/models/ */
 static char *resolve_model_path(const char *model_name)
 {
 	const char *url = registry_lookup(model_name);
@@ -392,6 +357,76 @@ static char *resolve_model_path(const char *model_name)
 	char sub[512];
 	snprintf(sub, sizeof(sub), "models/%s", filename);
 	return kora_path(sub);
+}
+
+/* --- launch helpers: build args + spawn thread for gen/compact/naming --- */
+
+static int launch_gen(const char *base_url, const char *model,
+                      const struct kora_session *session)
+{
+	struct kora_message *msgs = NULL;
+	int n = kora_session_snapshot(session, &msgs);
+	if (n < 0) return -1;
+
+	struct gen_args *ga = malloc(sizeof *ga);
+	if (!ga) { kora_session_snapshot_free(msgs, n); return -1; }
+	ga->base_url = strdup(base_url);
+	ga->model    = strdup(model);
+	ga->msgs     = msgs;
+	ga->n_msgs   = n;
+
+	gen_response = NULL;
+	generating = 1;
+	tui_statusbar("generating... (esc to cancel)");
+	pthread_t tid;
+	pthread_create(&tid, NULL, gen_thread_fn, ga);
+	pthread_detach(tid);
+	return 0;
+}
+
+static int launch_compact(const char *base_url, const char *model,
+                          const struct kora_session *session,
+                          const char *compact_prompt,
+                          int before_tokens)
+{
+	char *conv = kora_session_transcript(session);
+	if (!conv) return -1;
+
+	struct compact_args *ca = malloc(sizeof *ca);
+	if (!ca) { free(conv); return -1; }
+	ca->base_url       = strdup(base_url);
+	ca->model          = strdup(model);
+	ca->conversation   = conv;
+	ca->compact_prompt = strdup(compact_prompt ? compact_prompt
+	                      : "Summarize the following conversation concisely.");
+	ca->before_tokens  = before_tokens;
+
+	compacting = 1;
+	pthread_t tid;
+	pthread_create(&tid, NULL, compact_thread_fn, ca);
+	pthread_detach(tid);
+	return 0;
+}
+
+static int launch_naming(const char *base_url, const char *model,
+                         const struct kora_session *session,
+                         int session_id)
+{
+	char *conv = kora_session_transcript(session);
+	if (!conv) return -1;
+
+	struct naming_args *na = malloc(sizeof *na);
+	if (!na) { free(conv); return -1; }
+	na->base_url     = strdup(base_url);
+	na->model        = strdup(model);
+	na->conversation = conv;
+	na->session_id   = session_id;
+
+	naming_session = 1;
+	pthread_t tid;
+	pthread_create(&tid, NULL, naming_thread_fn, na);
+	pthread_detach(tid);
+	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -517,30 +552,39 @@ int main(int argc, char *argv[])
 		struct kora_config *cfg = kora_config_load(LUADIR);
 
 		/* resolve starting model: arg > -m > preferred > cfg->chat_model > cfg->default_model */
-		const char *model_name = NULL;
+		const char *model_arg = NULL;
 		char *preferred = NULL;
 
 		if (argc >= 3 && argv[2][0] != '-')
-			model_name = argv[2];
+			model_arg = argv[2];
 		for (int i = 2; i < argc - 1; i++)
 			if (strcmp(argv[i], "-m") == 0)
-				model_name = argv[i + 1];
-		if (!model_name) {
+				model_arg = argv[i + 1];
+		if (!model_arg) {
 			preferred = kora_preferred_model();
-			if (preferred) model_name = preferred;
+			if (preferred) model_arg = preferred;
 		}
-		if (!model_name && cfg->chat_model)    model_name = cfg->chat_model;
-		if (!model_name && cfg->default_model) model_name = cfg->default_model;
+		if (!model_arg && cfg->chat_model)    model_arg = cfg->chat_model;
+		if (!model_arg && cfg->default_model) model_arg = cfg->default_model;
 
-		/* own the model name so it survives free(preferred) */
-		char *current_model = model_name ? strdup(model_name) : NULL;
+		char *current_model = model_arg ? strdup(model_arg) : NULL;
 		free(preferred);
 		preferred = NULL;
 
 		const char *base_url = daemon_base_url();
 		int daemon_up = (kora_client_ping(base_url) == 0);
 
-		/* enter TUI */
+		/* session holds the active conversation state */
+		struct kora_session *session =
+			kora_session_new(current_model, cfg->system_chat);
+		if (!session) {
+			fprintf(stderr, "kora: out of memory\n");
+			free(current_model);
+			kora_config_free(cfg);
+			db_close();
+			return 1;
+		}
+
 		tui_init();
 		status_wire(STATUS_CONTEXT, NULL, NULL, 0);
 		tui_set_header("kora chat", current_model ? current_model : "no model");
@@ -554,26 +598,7 @@ int main(int argc, char *argv[])
 			tui_info("");
 		}
 
-		/* session tracking */
-		int session_id = -1;
-		int msg_seq = 0;
-		int user_msg_count = 0;
-		int session_named = 0;
-
-		#define MAX_TURNS 128
-		const char *roles[1 + MAX_TURNS * 2];
-		const char *contents[1 + MAX_TURNS * 2];
-		char *history_bufs[MAX_TURNS * 2];
-		int n_msg = 0;
-		int n_hist = 0;
-
-		if (cfg->system_chat) {
-			roles[0] = "system";
-			contents[0] = cfg->system_chat;
-			n_msg = 1;
-		}
-
-		update_context_status(approx_tokens(roles, contents, n_msg), cfg->ctx_size);
+		update_context_status(session, cfg->ctx_size);
 
 		int running = 1;
 		while (running) {
@@ -582,60 +607,30 @@ int main(int argc, char *argv[])
 			/* collect completed background work */
 
 			if (!generating && gen_response) {
-				history_bufs[n_hist] = gen_response;
-				roles[n_msg] = "assistant";
-				contents[n_msg] = history_bufs[n_hist];
-				n_msg++;
-				n_hist++;
-
-				if (session_id >= 0)
-					db_message_add(session_id, msg_seq++, "assistant", gen_response, 1);
-
+				kora_session_add(session, "assistant", gen_response);
+				if (session->db_id >= 0)
+					db_message_add(session->db_id, session->msg_seq++,
+					               "assistant", gen_response, 1);
+				free(gen_response);
 				gen_response = NULL;
-				update_context_status(approx_tokens(roles, contents, n_msg), cfg->ctx_size);
+				update_context_status(session, cfg->ctx_size);
 
-				/* auto-name after 10 user messages */
-				if (user_msg_count >= 10 && !session_named &&
-				    !naming_session && session_id >= 0 && current_model) {
-					char *conv_buf = malloc(8192);
-					if (conv_buf) {
-						int cpos = 0;
-						for (int j = cfg->system_chat ? 1 : 0; j < n_msg && cpos < 7000; j++) {
-							int len = snprintf(conv_buf + cpos, (size_t)(8192 - cpos),
-								"%s: %s\n", roles[j], contents[j]);
-							if (len > 0) cpos += len;
-						}
-						struct naming_args *na = malloc(sizeof(*na));
-						pthread_t tid;
-						na->base_url = strdup(base_url);
-						na->model = strdup(current_model);
-						na->conversation = conv_buf;
-						na->session_id = session_id;
-						naming_session = 1;
-						pthread_create(&tid, NULL, naming_thread_fn, na);
-						pthread_detach(tid);
-					}
-				}
+				if (session->user_msg_count >= 10 && !session->named &&
+				    !naming_session && session->db_id >= 0 && current_model)
+					launch_naming(base_url, current_model, session, session->db_id);
 			}
 
 			if (!compacting && compact_summary) {
-				for (int i = 0; i < n_hist; i++) free(history_bufs[i]);
-				n_hist = 0;
-				n_msg = cfg->system_chat ? 1 : 0;
-
-				history_bufs[n_hist] = compact_summary;
-				roles[n_msg] = "assistant";
-				contents[n_msg] = history_bufs[n_hist];
-				n_msg++;
-				n_hist++;
-
+				kora_session_clear(session);
+				kora_session_add(session, "assistant", compact_summary);
+				free(compact_summary);
 				compact_summary = NULL;
-				update_context_status(approx_tokens(roles, contents, n_msg), cfg->ctx_size);
+				update_context_status(session, cfg->ctx_size);
 			}
 
 			if (!naming_session && session_name_result) {
 				db_session_set_name(naming_session_id, session_name_result);
-				session_named = 1;
+				session->named = 1;
 				free(session_name_result);
 				session_name_result = NULL;
 			}
@@ -693,11 +688,11 @@ int main(int argc, char *argv[])
 							tui_info("Invalid session number. Use /resume to see the list.");
 						} else {
 							int del_id = sessions[del - 1].id;
-							if (del_id == session_id) {
-								session_id = -1;
-								msg_seq = 0;
-								user_msg_count = 0;
-								session_named = 0;
+							if (del_id == session->db_id) {
+								session->db_id = -1;
+								session->msg_seq = 0;
+								session->user_msg_count = 0;
+								session->named = 0;
 							}
 							db_session_delete(del_id);
 							tui_info("Session deleted.");
@@ -751,31 +746,27 @@ int main(int argc, char *argv[])
 							int idx = sel - 1;
 							int sid = sessions[idx].id;
 
-							for (int i = 0; i < n_hist; i++) free(history_bufs[i]);
-							n_hist = 0;
-							n_msg = cfg->system_chat ? 1 : 0;
+							kora_session_clear(session);
 
 							struct db_message *msgs = NULL;
 							int nm = db_messages_load(sid, &msgs);
 
-							msg_seq = 0;
-							user_msg_count = 0;
-							for (int i = 0; i < nm && n_msg < 1 + MAX_TURNS * 2 - 1; i++) {
+							session->msg_seq = 0;
+							session->user_msg_count = 0;
+							for (int i = 0; i < nm; i++) {
 								if (!msgs[i].llm_use) continue;
 								if (strcmp(msgs[i].role, "system") == 0) continue;
-								history_bufs[n_hist] = strdup(msgs[i].content);
-								roles[n_msg] = strcmp(msgs[i].role, "user") == 0 ? "user" : "assistant";
-								contents[n_msg] = history_bufs[n_hist];
-								n_msg++;
-								n_hist++;
-								if (strcmp(msgs[i].role, "user") == 0) user_msg_count++;
-								if (msgs[i].seq > msg_seq) msg_seq = msgs[i].seq;
+								kora_session_add(session, msgs[i].role, msgs[i].content);
+								if (strcmp(msgs[i].role, "user") == 0)
+									session->user_msg_count++;
+								if (msgs[i].seq > session->msg_seq)
+									session->msg_seq = msgs[i].seq;
 							}
-							msg_seq++;
+							session->msg_seq++;
 							db_messages_free(msgs, nm);
 
-							session_id = sid;
-							session_named = sessions[idx].name[0] != '\0' &&
+							session->db_id = sid;
+							session->named = sessions[idx].name[0] != '\0' &&
 								strcmp(sessions[idx].name, "New session") != 0;
 
 							tui_draw();
@@ -787,70 +778,45 @@ int main(int argc, char *argv[])
 							tui_info(resume_msg);
 							tui_info("");
 
-							for (int j = cfg->system_chat ? 1 : 0; j < n_msg; j++) {
-								if (strcmp(roles[j], "user") == 0) {
-									tui_user_msg(contents[j]);
+							for (int j = 0; j < session->n_msg; j++) {
+								if (strcmp(session->roles[j], "system") == 0) continue;
+								if (strcmp(session->roles[j], "user") == 0) {
+									tui_user_msg(session->contents[j]);
 								} else {
 									tui_assistant_begin();
-									tui_assistant_chunk(contents[j], 0);
+									tui_assistant_chunk(session->contents[j], 0);
 									tui_assistant_end();
 								}
 							}
 
-							update_context_status(approx_tokens(roles, contents, n_msg), cfg->ctx_size);
+							update_context_status(session, cfg->ctx_size);
 						}
 					}
 				}
 				free(input);
 			} else if (strcmp(input, "/clear") == 0) {
-				for (int i = 0; i < n_hist; i++) free(history_bufs[i]);
-				n_msg = cfg->system_chat ? 1 : 0;
-				n_hist = 0;
+				kora_session_clear(session);
 				tui_draw();
 				tui_draw_welcome(current_model);
 				tui_info("Conversation cleared.");
-				session_id = -1;
-				msg_seq = 0;
-				user_msg_count = 0;
-				session_named = 0;
-				update_context_status(approx_tokens(roles, contents, n_msg), cfg->ctx_size);
+				session->db_id = -1;
+				session->msg_seq = 0;
+				session->user_msg_count = 0;
+				session->named = 0;
+				update_context_status(session, cfg->ctx_size);
 				free(input);
 			} else if (strcmp(input, "/compact") == 0) {
 				if (!current_model) {
 					tui_info("No model selected. Use /model <name>.");
 				} else if (generating || compacting || naming_session) {
 					tui_info("Busy. Press ESC to cancel current task first.");
-				} else if (n_msg <= 1) {
+				} else if (session->n_msg <=
+				           (cfg->system_chat ? 1 : 0)) {
 					tui_info("Nothing to compact.");
 				} else {
-					size_t cap = 16384;
-					char *conv = malloc(cap);
-					size_t pos = 0;
-					for (int j = cfg->system_chat ? 1 : 0; j < n_msg; j++) {
-						int need = (int)(strlen(roles[j]) + strlen(contents[j]) + 16);
-						if (pos + (size_t)need >= cap) {
-							cap *= 2;
-							char *nb = realloc(conv, cap);
-							if (!nb) break;
-							conv = nb;
-						}
-						pos += (size_t)snprintf(conv + pos, cap - pos,
-						                        "%s: %s\n", roles[j], contents[j]);
-					}
-
-					int before = (int)(pos / 4);
-
-					struct compact_args *ca = malloc(sizeof(*ca));
-					pthread_t tid;
-					ca->base_url = strdup(base_url);
-					ca->model = strdup(current_model);
-					ca->conversation = conv;
-					ca->compact_prompt = strdup(cfg->compact_chat ? cfg->compact_chat :
-						"Summarize the following conversation concisely.");
-					ca->before_tokens = before;
-					compacting = 1;
-					pthread_create(&tid, NULL, compact_thread_fn, ca);
-					pthread_detach(tid);
+					launch_compact(base_url, current_model, session,
+					               cfg->compact_chat,
+					               kora_session_approx_tokens(session));
 				}
 				free(input);
 			} else if (strncmp(input, "/model", 6) == 0) {
@@ -884,24 +850,23 @@ int main(int argc, char *argv[])
 						free(new_path);
 						free(current_model);
 						current_model = strdup(new_name);
+						kora_session_set_model(session, current_model);
 						kora_set_preferred_model(current_model);
 						db_model_set_active(current_model);
 						tui_set_header("kora chat", current_model);
 
-						for (int i = 0; i < n_hist; i++) free(history_bufs[i]);
-						n_hist = 0;
-						n_msg = cfg->system_chat ? 1 : 0;
-						session_id = -1;
-						msg_seq = 0;
-						user_msg_count = 0;
-						session_named = 0;
+						kora_session_clear(session);
+						session->db_id = -1;
+						session->msg_seq = 0;
+						session->user_msg_count = 0;
+						session->named = 0;
 
 						char msg[256];
 						snprintf(msg, sizeof msg,
 						         "Switched to %s (daemon will load on next request).",
 						         current_model);
 						tui_info(msg);
-						update_context_status(approx_tokens(roles, contents, n_msg), cfg->ctx_size);
+						update_context_status(session, cfg->ctx_size);
 					}
 				}
 				free(input);
@@ -934,79 +899,32 @@ int main(int argc, char *argv[])
 			} else if (!current_model) {
 				tui_info("No model selected. Use /model <name> first.");
 				free(input);
-			} else if (n_msg >= 1 + MAX_TURNS * 2 - 1) {
-				tui_info("Conversation too long, use /clear or /exit.");
-				free(input);
-				running = 0;
 			} else {
-				if (session_id < 0) {
+				if (session->db_id < 0) {
 					char cwd[512];
 					if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
-					session_id = db_session_create("chat",
+					session->db_id = db_session_create("chat",
 						current_model ? current_model : "", cwd);
 				}
 
-				history_bufs[n_hist] = strdup(input);
-				roles[n_msg] = "user";
-				contents[n_msg] = history_bufs[n_hist];
-				n_msg++;
-				n_hist++;
-				user_msg_count++;
+				kora_session_add(session, "user", input);
+				session->user_msg_count++;
 
-				if (session_id >= 0)
-					db_message_add(session_id, msg_seq++, "user", input, 1);
+				if (session->db_id >= 0)
+					db_message_add(session->db_id, session->msg_seq++,
+					               "user", input, 1);
 
-				int tok = approx_tokens(roles, contents, n_msg);
-				update_context_status(tok, cfg->ctx_size);
+				int tok = kora_session_approx_tokens(session);
+				update_context_status(session, cfg->ctx_size);
 
-				/* auto-compact if approaching limit (best-effort; uses existing compact thread) */
 				if (ctx_needs_compression(tok, cfg->ctx_size) && !compacting) {
 					tui_info("Context approaching limit; compacting in background...");
-					/* build conversation text */
-					size_t cap = 16384;
-					char *conv = malloc(cap);
-					size_t pos = 0;
-					for (int j = cfg->system_chat ? 1 : 0; j < n_msg; j++) {
-						int need = (int)(strlen(roles[j]) + strlen(contents[j]) + 16);
-						if (pos + (size_t)need >= cap) {
-							cap *= 2;
-							char *nb = realloc(conv, cap);
-							if (!nb) break;
-							conv = nb;
-						}
-						pos += (size_t)snprintf(conv + pos, cap - pos,
-						                        "%s: %s\n", roles[j], contents[j]);
-					}
-					struct compact_args *ca = malloc(sizeof(*ca));
-					pthread_t tid;
-					ca->base_url = strdup(base_url);
-					ca->model = strdup(current_model);
-					ca->conversation = conv;
-					ca->compact_prompt = strdup(cfg->compact_chat ? cfg->compact_chat :
-						"Summarize the following conversation concisely.");
-					ca->before_tokens = tok;
-					compacting = 1;
-					pthread_create(&tid, NULL, compact_thread_fn, ca);
-					pthread_detach(tid);
+					launch_compact(base_url, current_model, session,
+					               cfg->compact_chat, tok);
 				}
 
-				struct gen_args *ga = malloc(sizeof(*ga));
-				ga->base_url = strdup(base_url);
-				ga->model = strdup(current_model);
-				ga->msgs = dup_msgs(roles, contents, n_msg);
-				ga->n_msgs = n_msg;
-				if (!ga->msgs) {
-					free(ga->base_url); free(ga->model); free(ga);
+				if (launch_gen(base_url, current_model, session) != 0)
 					tui_info("Out of memory.");
-					free(input);
-					continue;
-				}
-				gen_response = NULL;
-				generating = 1;
-				tui_statusbar("generating... (esc to cancel)");
-				pthread_t tid;
-				pthread_create(&tid, NULL, gen_thread_fn, ga);
-				pthread_detach(tid);
 
 				free(input);
 			}
@@ -1023,8 +941,8 @@ int main(int argc, char *argv[])
 		free(compact_summary);  compact_summary = NULL;
 		free(session_name_result); session_name_result = NULL;
 
-		for (int i = 0; i < n_hist; i++) free(history_bufs[i]);
 		tui_cleanup();
+		kora_session_free(session);
 		free(current_model);
 		kora_config_free(cfg);
 		db_close();
