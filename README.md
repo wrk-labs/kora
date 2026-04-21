@@ -7,13 +7,11 @@ Kora runs large language models entirely on your machine — no cloud, no API ke
 ## Features
 
 - **Chat** — interactive conversations with local LLMs
-- **Code** — agentic coding assistant with file editing, search, and shell access
 - **Model management** — download, list, switch, and remove GGUF models
 - **Context compression** — automatic and manual conversation compaction
 - **Non-blocking UI** — model loading, generation, compaction all run in background threads
 - **Generation control** — cancel any running task with ESC
 - **Scrollable chat** — PgUp/PgDn and mouse wheel support
-- **Plugins** — extend functionality with Lua scripts
 - **GPU acceleration** — automatic VRAM detection and layer offloading
 
 ## Install
@@ -36,7 +34,6 @@ make GGML_METAL=1     # Apple Silicon
 ```
 kora                  # start chatting (default)
 kora chat [model]     # start chatting with a specific model
-kora code [model]     # coding assistant (wip)
 kora help             # print usage information
 kora version          # print version
 ```
@@ -63,7 +60,6 @@ All data lives under `~/.kora/`:
 ~/.kora/
 ├── models/         # downloaded GGUF files
 ├── sessions/       # conversation history
-├── plugins/        # user plugins
 ├── config.lua      # settings
 └── kora.db         # session and model database (SQLite)
 ```
@@ -76,9 +72,8 @@ kora/
 │   ├── core/       # main loop, config, database, dispatch
 │   ├── llm/        # inference, model management, registry
 │   ├── ui/         # TUI (ncurses), event queue, status handlers, input
-│   ├── sql/        # schema and migrations
-│   └── agent/      # Lua bridge
-├── lua/            # Lua agent and plugins
+│   └── sql/        # schema and migrations
+├── lua/            # Lua configuration (system prompts, user config template)
 │   └── core/
 ├── vendor/         # llama.cpp, Lua 5.5 (vendored)
 ├── Makefile

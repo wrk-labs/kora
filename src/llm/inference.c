@@ -12,7 +12,6 @@
 #include "llama.h"
 #include "ggml.h"
 #include "inference.h"
-#include "chat_native.h"
 
 static uint64_t get_available_memory(void)
 {
@@ -152,11 +151,6 @@ struct kora_ctx *kora_load(const char *model_path, int n_ctx, int n_gpu_layers, 
 	llama_sampler_chain_add(kc->sampler, llama_sampler_init_temp(0.7f));
 	llama_sampler_chain_add(kc->sampler, llama_sampler_init_dist(0));
 
-	/* probe native tool calling support: build a chat_templates handle
-	   and check if the format is anything other than CONTENT_ONLY. */
-	kc->native = kora_native_chat_create(kc->model);
-	kc->native_supports_tools = kc->native ? kora_native_chat_supports_tools(kc->native) : 0;
-
 	return kc;
 }
 
@@ -164,8 +158,6 @@ void kora_free(struct kora_ctx *kc)
 {
 	if (!kc)
 		return;
-	if (kc->native)
-		kora_native_chat_free(kc->native);
 	if (kc->sampler)
 		llama_sampler_free(kc->sampler);
 	if (kc->ctx)

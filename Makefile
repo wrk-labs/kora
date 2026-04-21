@@ -4,14 +4,11 @@ VERSION = 0.1.0
 UNAME_S := $(shell uname -s)
 
 SRC_C = src/core/main.c src/core/util.c src/core/db.c src/core/dispatch.c \
+        src/core/config.c \
         src/llm/inference.c src/llm/model.c src/llm/registry.c \
-        src/ui/tui.c src/ui/input.c src/ui/event.c src/ui/status.c \
-        src/agent/lua_bridge.c src/agent/run.c src/agent/parser.c \
-        src/agent/loop.c src/agent/guards.c
+        src/ui/tui.c src/ui/input.c src/ui/event.c src/ui/status.c
 
-SRC_CXX = src/llm/chat_native.cpp
-
-OBJ = $(SRC_C:.c=.o) $(SRC_CXX:.cpp=.o)
+OBJ = $(SRC_C:.c=.o)
 BIN = kora
 
 LLAMA_BUILD = vendor/llama.cpp/build
@@ -31,9 +28,7 @@ CFLAGS += -Ivendor/llama.cpp/include -Ivendor/llama.cpp/ggml/include
 CFLAGS += -Ivendor/llama.cpp -Ivendor/llama.cpp/common
 CFLAGS += -Ivendor/llama.cpp/vendor
 CFLAGS += -Ivendor/lua/src
-CFLAGS += -Isrc/core -Isrc/llm -Isrc/ui -Isrc/agent
-
-CXXFLAGS += $(CFLAGS) -std=c++17
+CFLAGS += -Isrc/core -Isrc/llm -Isrc/ui
 
 ifeq ($(UNAME_S),Darwin)
   NPROC := $(shell sysctl -n hw.ncpu)
@@ -92,11 +87,8 @@ $(BIN): $(OBJ) $(LLAMA_LIB) $(LUA_LIB)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
 clean:
-	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR) tests/c/test_parser
+	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
 
 clean-all: clean
 	rm -rf $(LLAMA_BUILD)
@@ -105,41 +97,15 @@ clean-all: clean
 install: $(BIN) $(LLAMA_SERVER)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	mkdir -p $(DESTDIR)$(LUADIR)/core
-	mkdir -p $(DESTDIR)$(LUADIR)/plugins
-	mkdir -p $(DESTDIR)$(LUADIR)/tools
-	mkdir -p $(DESTDIR)$(LUADIR)/agents/sub
 	cp -f $(BIN) $(DESTDIR)$(PREFIX)/bin
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/$(BIN)
 	cp -f $(LLAMA_SERVER) $(DESTDIR)$(PREFIX)/bin/llama-server
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/llama-server
-	cp -f lua/core/*.lua $(DESTDIR)$(LUADIR)/core/ 2>/dev/null || true
-	cp -f lua/plugins/*.lua $(DESTDIR)$(LUADIR)/plugins/ 2>/dev/null || true
-	cp -f lua/tools/*.lua $(DESTDIR)$(LUADIR)/tools/ 2>/dev/null || true
-	cp -f lua/agents/*.lua $(DESTDIR)$(LUADIR)/agents/ 2>/dev/null || true
-	cp -f lua/agents/sub/*.lua $(DESTDIR)$(LUADIR)/agents/sub/ 2>/dev/null || true
+	cp -f lua/core/*.lua $(DESTDIR)$(LUADIR)/core/
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
 	rm -f $(DESTDIR)$(PREFIX)/bin/llama-server
 	rm -rf $(DESTDIR)$(LUADIR)
 
-.PHONY: all clean clean-all install uninstall test test-lua test-c
-
-# --- tests ---
-
-LUA_BIN = vendor/lua/src/lua
-
-test: test-lua test-c
-	@echo ""
-	@printf '  \033[1mall test suites passed\033[0m\n'
-
-test-lua: $(LUA_LIB)
-	@printf '\n\033[1mlua\033[0m\n'
-	@$(LUA_BIN) tests/lua/run.lua
-
-test-c: tests/c/test_parser
-	@printf '\n'
-	@./tests/c/test_parser
-
-tests/c/test_parser: tests/c/test_parser.c src/agent/parser.c src/agent/parser.h
-	@$(CC) -Wall -Wextra -O2 -Isrc/agent -o $@ tests/c/test_parser.c src/agent/parser.c
+.PHONY: all clean clean-all install uninstall
