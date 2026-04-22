@@ -99,10 +99,49 @@ $(HTTPLIB_OBJ): $(HTTPLIB_SRC)
 
 clean:
 	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
+	rm -f $(TEST_BINS) $(TEST_OBJ)
 
 clean-all: clean
 	rm -rf $(LLAMA_BUILD)
 	$(MAKE) -C vendor/lua clean
+
+# --- tests ---
+# each tests/test_*.c produces its own binary linked against the pieces of
+# kora it exercises. `make test` builds and runs all of them; any non-zero
+# exit status aborts the run. no external test framework — tests/test.h is
+# a 50-line harness.
+TEST_SRC = tests/test_registry.c tests/test_session.c tests/test_client.c \
+           tests/test_db.c tests/test_config.c
+TEST_BINS = $(TEST_SRC:.c=)
+TEST_OBJ = $(TEST_SRC:.c=.o)
+
+TEST_CFLAGS = $(CFLAGS) -Itests
+
+tests/test_registry: tests/test_registry.o src/llm/registry.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
+
+tests/test_session: tests/test_session.o src/ui/session.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
+
+tests/test_client: tests/test_client.o src/llm/client.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
+
+tests/test_db: tests/test_db.o src/core/db.o src/core/util.o \
+               src/llm/model.o src/llm/registry.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
+
+tests/test_config: tests/test_config.o src/core/config.o src/core/util.o $(LUA_LIB)
+	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
+
+tests/%.o: tests/%.c
+	$(CC) $(TEST_CFLAGS) -c $< -o $@
+
+test: $(TEST_BINS)
+	@fail=0; for t in $(TEST_BINS); do \
+		echo "---- $$t ----"; \
+		if ! ./$$t; then fail=1; fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then echo "TESTS FAILED"; exit 1; else echo "all tests passed"; fi
 
 install: $(BIN) $(LLAMA_SERVER)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
@@ -118,4 +157,4 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/llama-server
 	rm -rf $(DESTDIR)$(LUADIR)
 
-.PHONY: all clean clean-all install uninstall
+.PHONY: all clean clean-all install uninstall test

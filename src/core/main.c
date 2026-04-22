@@ -181,16 +181,21 @@ static void *gen_thread_fn(void *arg)
 	return NULL;
 }
 
-static void gen_cancel(void)
+/* shared cancel loop: set the flag, poll the op's running-bit until the
+   worker notices and clears it, then reset so the next op isn't pre-cancelled.
+   generating/compacting are volatile, so the compiler won't hoist the load. */
+static void cancel_op(volatile int *running)
 {
-	if (!generating) return;
+	if (!*running) return;
 	op_cancel_flag = 1;
-	while (generating) {
+	while (*running) {
 		struct timespec ts = {0, 10 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
 	op_cancel_flag = 0;
 }
+
+static void gen_cancel(void)     { cancel_op(&generating); }
 
 /* --- background compact --- */
 
@@ -248,16 +253,7 @@ static void *compact_thread_fn(void *arg)
 	return NULL;
 }
 
-static void compact_cancel(void)
-{
-	if (!compacting) return;
-	op_cancel_flag = 1;
-	while (compacting) {
-		struct timespec ts = {0, 10 * 1000 * 1000};
-		nanosleep(&ts, NULL);
-	}
-	op_cancel_flag = 0;
-}
+static void compact_cancel(void) { cancel_op(&compacting); }
 
 /* --- background session naming --- */
 
@@ -527,34 +523,10 @@ static void version(void)
 
 static char *resolve_model_path(const char *model_name)
 {
-	const char *url = registry_lookup(model_name);
-	char fname_buf[256];
-	const char *filename;
-	if (url) {
-		/* registry: file name comes from the URL's last segment. */
-		const char *slash = strrchr(url, '/');
-		filename = slash ? slash + 1 : url;
-	} else {
-		/* manual / non-registry alias: db_model_add stores the alias
-		   with the trailing ".gguf" stripped, so we reconstruct by
-		   appending it here. leave alone if the caller already passed
-		   a name ending in ".gguf" (edge case — e.g. typed manually). */
-		size_t nlen = strlen(model_name);
-		int has_ext = (nlen >= 5 && strcmp(model_name + nlen - 5, ".gguf") == 0);
-		if (has_ext) {
-			filename = model_name;
-		} else {
-			snprintf(fname_buf, sizeof fname_buf, "%s.gguf", model_name);
-			filename = fname_buf;
-		}
-	}
-	if (strstr(filename, "..") || strchr(filename, '/')) {
+	char *path = model_resolve_path(model_name);
+	if (!path)
 		fprintf(stderr, "kora: invalid model name '%s'\n", model_name);
-		return NULL;
-	}
-	char sub[512];
-	snprintf(sub, sizeof(sub), "models/%s", filename);
-	return kora_path(sub);
+	return path;
 }
 
 /* --- launch helpers: build args + spawn thread for gen/compact/naming --- */
@@ -1136,10 +1108,14 @@ int main(int argc, char *argv[])
 					tui_info("A background task is already running.");
 				} else {
 					struct pull_args *pa = malloc(sizeof *pa);
-					snprintf(pa->target, sizeof pa->target, "%s", alias);
-					tui_log("Downloading %s…", alias);
-					__atomic_add_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
-					dispatch(bg_pull_fn, pa);
+					if (!pa) {
+						tui_info("Out of memory.");
+					} else {
+						snprintf(pa->target, sizeof pa->target, "%s", alias);
+						tui_log("Downloading %s…", alias);
+						__atomic_add_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
+						dispatch(bg_pull_fn, pa);
+					}
 				}
 				free(input);
 			} else if (strcmp(input, "/model_cancel") == 0) {
@@ -1495,10 +1471,14 @@ int main(int argc, char *argv[])
 					tui_info("A background task is already running.");
 				} else {
 					struct pull_args *pa = malloc(sizeof(*pa));
-					snprintf(pa->target, sizeof(pa->target), "%s", target);
-					tui_log("Downloading %s…", target);
-					__atomic_add_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
-					dispatch(bg_pull_fn, pa);
+					if (!pa) {
+						tui_info("Out of memory.");
+					} else {
+						snprintf(pa->target, sizeof(pa->target), "%s", target);
+						tui_log("Downloading %s…", target);
+						__atomic_add_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
+						dispatch(bg_pull_fn, pa);
+					}
 				}
 				free(input);
 			} else {
@@ -1517,14 +1497,18 @@ chat_send_path:
 				   current op finishes; subsequent entries fire as each
 				   generation completes. */
 				struct pending_msg *node = malloc(sizeof *node);
-				if (node) {
-					node->text = strdup(input);
+				char *text_copy = node ? strdup(input) : NULL;
+				if (node && text_copy) {
+					node->text = text_copy;
 					node->next = NULL;
 					if (queue_tail) queue_tail->next = node;
 					else            queue_head = node;
 					queue_tail = node;
 					queue_count++;
 					QUEUE_REFRESH_INDICATOR();
+				} else {
+					free(node);
+					free(text_copy);
 				}
 				free(input);
 			} else if (!current_model) {

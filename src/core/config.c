@@ -37,8 +37,6 @@ struct kora_config *kora_config_load(const char *luadir)
 	cfg->system_chat = NULL;
 	cfg->compact_chat = NULL;
 	cfg->ctx_size = 4096;
-	cfg->threads = 0;
-	cfg->gpu_layers = -2;
 
 	lua_State *L = luaL_newstate();
 	if (!L)
@@ -66,8 +64,6 @@ struct kora_config *kora_config_load(const char *luadir)
 		s = lua_getfield_str(L, -1, "chat_model");
 		if (s) { free(cfg->chat_model); cfg->chat_model = s; }
 		cfg->ctx_size = lua_getfield_int(L, -1, "ctx_size", cfg->ctx_size);
-		cfg->threads = lua_getfield_int(L, -1, "threads", cfg->threads);
-		cfg->gpu_layers = lua_getfield_int(L, -1, "gpu_layers", cfg->gpu_layers);
 		lua_pop(L, 1);
 	}
 	free(cfgpath);

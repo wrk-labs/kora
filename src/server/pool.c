@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 #include "internal.h"
-#include "registry.h"
+#include "model.h"
 #include "util.h"
 
 #ifndef KORA_POOL_MAX_RESIDENT
@@ -120,33 +120,6 @@ static int pick_free_port(void)
 	int port = ntohs(addr.sin_port);
 	close(fd);
 	return port;
-}
-
-static char *resolve_model_path(const char *model_name)
-{
-	const char *url = registry_lookup(model_name);
-	char fname_buf[256];
-	const char *filename;
-	if (url) {
-		const char *slash = strrchr(url, '/');
-		filename = slash ? slash + 1 : url;
-	} else {
-		/* manual / non-registry alias: db_model_add stores the alias
-		   with the trailing ".gguf" stripped, so we reconstruct here
-		   (mirror of main.c's resolve_model_path). */
-		size_t nlen = strlen(model_name);
-		int has_ext = (nlen >= 5 && strcmp(model_name + nlen - 5, ".gguf") == 0);
-		if (has_ext) {
-			filename = model_name;
-		} else {
-			snprintf(fname_buf, sizeof fname_buf, "%s.gguf", model_name);
-			filename = fname_buf;
-		}
-	}
-	if (strstr(filename, "..") || strchr(filename, '/')) return NULL;
-	char sub[512];
-	snprintf(sub, sizeof sub, "models/%s", filename);
-	return kora_path(sub);
 }
 
 static const char *llama_server_path(void)
@@ -274,7 +247,7 @@ int kora_pool_ensure_ready(const char *requested, int *out_slot)
 
 	/* --- outside the lock: resolve + fork + health probe --- */
 
-	char *gguf = resolve_model_path(model);
+	char *gguf = model_resolve_path(model);
 	struct stat st;
 	if (!gguf || stat(gguf, &st) != 0) {
 		fprintf(stderr, "kora: model file missing: %s\n", model);

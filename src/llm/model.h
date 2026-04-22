@@ -26,6 +26,13 @@ int model_pull(const char *target);
 /* check if a resolved model file exists */
 int model_exists(const char *model_path);
 
+/* resolve a model alias/filename to an absolute path under ~/.kora/models/.
+   looks the name up in the registry first (using the URL's last segment for
+   the filename); falls back to "<name>.gguf" for manually-added models.
+   rejects names containing '/' or ".." as a basic path-traversal guard.
+   returns a caller-owned string (free it), or NULL on bad input / OOM. */
+char *model_resolve_path(const char *model_name);
+
 /* read a GGUF file's metadata header and extract the human-readable
    `general.name` (optional: `general.size_label`) into caller buffers.
    returns 0 on success, -1 on any read/parse error. output buffers are

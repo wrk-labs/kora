@@ -30,4 +30,10 @@ int kora_client_count_tokens(const char *base_url, const char *model, const char
 /* GET /kora/status; returns 0 if daemon is reachable and healthy. */
 int kora_client_ping(const char *base_url);
 
+/* extract the value of the first `"content":"..."` pair from a JSON object,
+   unescaping \n \t \" \uXXXX (BMP) etc into `out`. returns the number of
+   bytes written (excluding the NUL terminator), or -1 if `"content"` is
+   missing / malformed. `out_cap` must be > 0. exposed for unit tests. */
+int kora_json_extract_content(const char *json, char *out, int out_cap);
+
 #endif

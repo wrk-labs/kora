@@ -119,6 +119,7 @@ kora/
 │   └── sql/        # schema (embedded into the binary at build time)
 ├── lua/            # Lua configuration (system prompts, user config template)
 │   └── core/
+├── tests/          # unit tests — one binary per module, `make test` runs all
 ├── vendor/         # llama.cpp, Lua 5.5 (vendored)
 ├── Makefile
 ├── config.mk
@@ -133,6 +134,19 @@ kora/
 - **Priority-based right statusbar** — handler system where higher-priority handlers (download progress) override lower ones (context info) automatically.
 - **Pad-based chat scrolling** — ncurses pad with virtual height, mouse-wheel scroll, reflow-on-resize from a source-of-truth log.
 - **Pane-driven commands** — user actions come from focused-pane shortcuts rather than typed slash commands; the status bar hint always reflects what the current keystroke will do.
+
+## Development
+
+```
+make test             # build and run the unit-test suite
+make clean            # remove build artifacts (keeps vendored deps)
+make clean-all        # also wipe vendored llama.cpp and lua builds
+```
+
+Tests live under `tests/` — one binary per module (`test_registry`,
+`test_session`, `test_client`, `test_db`, `test_config`) — and use a tiny
+harness in `tests/test.h`. DB / config tests sandbox themselves under
+`/tmp` via `mkdtemp` and never touch your real `~/.kora/`.
 
 ## Known issues
 

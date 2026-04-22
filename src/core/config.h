@@ -7,8 +7,6 @@ struct kora_config {
 	char *system_chat;
 	char *compact_chat;
 	int ctx_size;
-	int threads;
-	int gpu_layers;        /* -2 = auto, -1 = all, 0 = cpu, N = fixed */
 };
 
 struct kora_config *kora_config_load(const char *luadir);

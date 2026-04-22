@@ -172,6 +172,38 @@ static int has_suffix(const char *str, const char *suffix)
 	return strcmp(str + slen - xlen, suffix) == 0;
 }
 
+char *model_resolve_path(const char *model_name)
+{
+	if (!model_name || !*model_name)
+		return NULL;
+
+	const char *url = registry_lookup(model_name);
+	char fname_buf[256];
+	const char *filename;
+
+	if (url) {
+		filename = filename_from_url(url);
+	} else {
+		/* manual / non-registry alias: db_model_add stores the alias
+		   with the trailing ".gguf" stripped, so we reconstruct here.
+		   leave alone if the caller already passed a name ending in
+		   ".gguf" (edge case — e.g. typed manually). */
+		if (has_suffix(model_name, ".gguf")) {
+			filename = model_name;
+		} else {
+			snprintf(fname_buf, sizeof fname_buf, "%s.gguf", model_name);
+			filename = fname_buf;
+		}
+	}
+
+	if (strstr(filename, "..") || strchr(filename, '/'))
+		return NULL;
+
+	char sub[512];
+	snprintf(sub, sizeof sub, "models/%s", filename);
+	return kora_path(sub);
+}
+
 /* GGUF files begin with the 4-byte magic "GGUF" (0x47 47 55 46). any other
    prefix (HTML error page, JSON, empty file) means the URL pointed at
    something that isn't a model. returns 1 on match, 0 otherwise. */

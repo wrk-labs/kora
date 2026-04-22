@@ -76,7 +76,7 @@ static int sb_puts_json_escaped(struct sb *s, const char *str)
 /* given a pointer to a JSON object string, find the value of "content":"..."
    (the FIRST occurrence inside `choices[0].delta.content`). writes unescaped
    bytes into out; returns number of bytes written. -1 if not found. */
-static int json_extract_content(const char *json, char *out, int out_cap)
+int kora_json_extract_content(const char *json, char *out, int out_cap)
 {
 	const char *p = strstr(json, "\"content\"");
 	if (!p) return -1;
@@ -196,7 +196,7 @@ static void on_sse_line(struct stream_ctx *ctx, const char *line, size_t len)
 	char *token = malloc(dlen + 1);
 	if (!token) { free(copy); return; }
 
-	int n = json_extract_content(copy, token, (int)(dlen + 1));
+	int n = kora_json_extract_content(copy, token, (int)(dlen + 1));
 	if (n > 0) {
 		if (ctx->opts->chunk_cb)
 			ctx->opts->chunk_cb(token, n, ctx->opts->chunk_user_data);

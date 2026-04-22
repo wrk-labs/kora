@@ -34,30 +34,35 @@ char *kora_path(const char *sub)
 	return path;
 }
 
-static void copy_file(const char *src, const char *dst)
+/* 0 on success, -1 on any open/read/write failure. */
+static int copy_file(const char *src, const char *dst)
 {
 	FILE *in = fopen(src, "r");
 	if (!in)
-		return;
+		return -1;
 	FILE *out = fopen(dst, "w");
 	if (!out) {
 		fclose(in);
-		return;
+		return -1;
 	}
 	char buf[4096];
 	size_t n;
-	while ((n = fread(buf, 1, sizeof(buf), in)) > 0)
-		fwrite(buf, 1, n, out);
+	int rc = 0;
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+		if (fwrite(buf, 1, n, out) != n) { rc = -1; break; }
+	}
+	if (ferror(in)) rc = -1;
 	fclose(in);
-	fclose(out);
+	if (fclose(out) != 0) rc = -1;
+	return rc;
 }
 
 int kora_init_dirs(void)
 {
-	char *dirs[] = { "", "models", "sessions", "plugins" };
-	int i;
+	const char *dirs[] = { "", "models", "sessions" };
+	size_t i;
 
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
 		char *path = kora_path(dirs[i]);
 		if (!path)
 			return -1;
