@@ -21,7 +21,7 @@ struct kora_session {
 
 	/* persistence bookkeeping */
 	int msg_seq;                 /* next seq for db_message_add */
-	int user_msg_count;          /* used to trigger auto-naming at 10 */
+	int user_msg_count;          /* used to trigger auto-naming at 3 */
 	int named;                   /* 1 once auto-named */
 };
 

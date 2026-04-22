@@ -1535,12 +1535,19 @@ static void render_info(const char *text)
 	chat_scroll_bottom();
 
 	/* uniform leading blank so info lines are separated the same way
-	   user / assistant messages are. multi-line info dumps (/help,
-	   /resume listing, /model listing) end up with a blank between
-	   each row, which reads fine and is consistent. callers no longer
-	   need to sprinkle tui_info("") spacers. */
+	   user / assistant messages are. callers that want a tight block
+	   (e.g. /help) pass embedded newlines in one call, which we
+	   re-indent below so every line keeps the same 2-space prefix. */
 	wattron(win_chat, A_DIM);
-	wprintw(win_chat, "\n  %s\n", text);
+	waddch(win_chat, '\n');
+	const char *line = text;
+	for (;;) {
+		const char *nl = strchr(line, '\n');
+		size_t len = nl ? (size_t)(nl - line) : strlen(line);
+		wprintw(win_chat, "  %.*s\n", (int)len, line);
+		if (!nl) break;
+		line = nl + 1;
+	}
 	wattroff(win_chat, A_DIM);
 	refresh_chat();
 }

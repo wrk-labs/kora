@@ -837,7 +837,7 @@ int main(int argc, char *argv[])
 				gen_response = NULL;
 				update_context_status(session, cfg->ctx_size);
 
-				if (session->user_msg_count >= 10 && !session->named &&
+				if (session->user_msg_count >= 3 && !session->named &&
 				    !naming_session && session->db_id >= 0 && current_model)
 					launch_naming(base_url, current_model, session, session->db_id);
 			}
@@ -970,8 +970,10 @@ int main(int argc, char *argv[])
 				free(input);
 				running = 0;
 			} else if (strcmp(input, "/help") == 0) {
+				/* silently swallow help during any background op so a
+				   stray Alt+H mid-stream doesn't splice text into the
+				   assistant's output. */
 				if (generating || compacting || naming_session) {
-					tui_info("Busy. Press Esc to cancel first.");
 					free(input);
 					continue;
 				}
@@ -983,31 +985,40 @@ int main(int argc, char *argv[])
 					continue;
 				}
 				last_help_time = now;
-				tui_info("────────────────────────────────────────");
-				tui_info("Help:");
-				tui_info("Global:");
-				tui_info("  Tab            Cycle focus forward (SESSIONS → CHAT → MODELS)");
-				tui_info("  Shift+Tab      Cycle focus backward");
-				tui_info("  Esc            Cancel: generation, or command entry (r/m/p)");
-				tui_info("  Ctrl-C         Quit kora");
-				tui_info("CHAT:");
-				tui_info("  type + Enter   Send message");
-				tui_info("  Alt+Enter      Insert newline");
-				tui_info("  Alt+H          Show help");
-				tui_info("SESSIONS:");
-				tui_info("  j / k          Highlight next / previous session");
-				tui_info("  Enter          Open highlighted session");
-				tui_info("  n              New session");
-				tui_info("  d              Delete highlighted session");
-				tui_info("  r              Rename highlighted session (type the new name)");
-				tui_info("Note: context auto-compacts when > 75% full. No manual command.");
-				tui_info("MODELS:");
-				tui_info("  j / k          Highlight next / previous model");
-				tui_info("  Enter          Switch to highlighted model");
-				tui_info("  p              Pull the highlighted model");
-				tui_info("  u              Pull a model by URL (prompts)");
-				tui_info("  d              Remove the highlighted model (or cancel its download)");
-				tui_info("────────────────────────────────────────");
+				/* one tui_info call → one leading/trailing blank for the
+				   whole block, rather than one per row. render_info
+				   re-indents each embedded newline to match. */
+				tui_info(
+					"────────────────────────────────────────\n"
+					"Help:\n"
+					"\n"
+					"Global:\n"
+					"  Tab            Cycle focus forward (SESSIONS → CHAT → MODELS)\n"
+					"  Shift+Tab      Cycle focus backward\n"
+					"  Esc            Cancel: generation, or command entry (r/m/p)\n"
+					"  Ctrl-C         Quit kora\n"
+					"\n"
+					"CHAT:\n"
+					"  type + Enter   Send message\n"
+					"  Alt+Enter      Insert newline\n"
+					"  Alt+H          Show help\n"
+					"\n"
+					"SESSIONS:\n"
+					"  j / k          Highlight next / previous session\n"
+					"  Enter          Open highlighted session\n"
+					"  n              New session\n"
+					"  d              Delete highlighted session\n"
+					"  r              Rename highlighted session (type the new name)\n"
+					"\n"
+					"MODELS:\n"
+					"  j / k          Highlight next / previous model\n"
+					"  Enter          Switch to highlighted model\n"
+					"  p              Pull the highlighted model\n"
+					"  u              Pull a model by URL (prompts)\n"
+					"  d              Remove the highlighted model (or cancel its download)\n"
+					"\n"
+					"Note: context auto-compacts when > 75% full. No manual command.\n"
+					"────────────────────────────────────────");
 				free(input);
 			} else if (strcmp(input, "/open") == 0) {
 				/* open the session highlighted in the SESSIONS pane */
