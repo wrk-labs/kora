@@ -10,6 +10,7 @@ struct registry_entry registry[] = {
 	{ "qwen-3-8b",       "https://huggingface.co/bartowski/Qwen_Qwen3-8B-GGUF/resolve/main/Qwen_Qwen3-8B-Q4_K_M.gguf",                                   "5.0G", "Q4_K_M" },
 	{ "llama-3.1-8b",    "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",          "4.9G", "Q4_K_M" },
 	{ "deepseek-r1-8b",  "https://huggingface.co/bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF/resolve/main/DeepSeek-R1-Distill-Llama-8B-Q4_K_M.gguf",      "4.9G", "Q4_K_M" },
+	{ "dolphin-3-8b",    "https://huggingface.co/bartowski/Dolphin3.0-Llama3.1-8B-GGUF/resolve/main/Dolphin3.0-Llama3.1-8B-Q4_K_M.gguf",               "4.9G", "Q4_K_M" },
 	/* coding models */
 	{ "qwen-coder-1.5b", "https://huggingface.co/bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",       "1.0G", "Q4_K_M" },
 	{ "qwen-coder-7b",   "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",           "4.5G", "Q4_K_M" },

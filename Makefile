@@ -42,11 +42,11 @@ ifeq ($(UNAME_S),Darwin)
   else
     NCURSES_LIB = -lncurses
   endif
-  PLATFORM_LIBS = -lm -lpthread $(NCURSES_LIB) -lsqlite3 -lcurl
+  PLATFORM_LIBS = -lm -lpthread $(NCURSES_LIB) -lsqlite3
 else
   NPROC := $(shell nproc)
   LUA_PLATFORM = linux
-  PLATFORM_LIBS = -lm -lpthread -lstdc++ -lncursesw -lsqlite3 -lcurl
+  PLATFORM_LIBS = -lm -lpthread -lstdc++ -lncursesw -lsqlite3
 endif
 
 # default target

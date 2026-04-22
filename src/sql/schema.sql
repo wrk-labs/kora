@@ -2,14 +2,15 @@
 -- ~/.kora/kora.db
 
 CREATE TABLE IF NOT EXISTS models (
-    alias       TEXT PRIMARY KEY,
-    filename    TEXT NOT NULL,
-    url         TEXT,
-    size        TEXT,
-    quant       TEXT,
-    downloaded  INTEGER DEFAULT 0,
-    active      INTEGER DEFAULT 0,
-    source      TEXT DEFAULT 'registry'  -- 'registry' or 'manual'
+    alias        TEXT PRIMARY KEY,
+    filename     TEXT NOT NULL,
+    url          TEXT,
+    size         TEXT,
+    quant        TEXT,
+    downloaded   INTEGER DEFAULT 0,
+    active       INTEGER DEFAULT 0,
+    source       TEXT DEFAULT 'registry',  -- 'registry' or 'manual'
+    display_name TEXT                      -- from GGUF `general.name` for manual pulls
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS messages (
     seq         INTEGER NOT NULL,
     role        TEXT NOT NULL,       -- 'system', 'user', 'assistant'
     content     TEXT NOT NULL,
+    model       TEXT,                -- alias of the model in effect for this turn
     llm_use     INTEGER DEFAULT 1,   -- include in prompt when building context
     created_at  TEXT DEFAULT (datetime('now'))
 );

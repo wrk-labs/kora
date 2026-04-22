@@ -12,13 +12,12 @@ enum tui_event_type {
 	TUI_EV_CHAT_CHUNK,
 	TUI_EV_CHAT_END,
 	TUI_EV_USER_MSG,
-	TUI_EV_SPINNER,
 };
 
 struct tui_event {
 	enum tui_event_type type;
 	char *data;  /* heap-allocated, owned by the event */
-	int len;     /* chunk byte length, or on/off for spinner */
+	int len;     /* chunk byte length */
 };
 
 void event_init(void);

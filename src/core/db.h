@@ -25,10 +25,13 @@ int db_model_is_downloaded(const char *name);
 void db_model_set_downloaded(const char *name, int downloaded);
 
 /* iterate all known models (registry + manually added).
-   callback receives: alias, filename, size, quant, downloaded, active, user_data */
+   callback receives: alias, filename, size, quant, downloaded, active,
+   display_name (may be NULL), user_data */
 typedef void (*db_model_cb)(const char *alias, const char *filename,
                             const char *size, const char *quant,
-                            int downloaded, int active, void *user_data);
+                            int downloaded, int active,
+                            const char *display_name,
+                            void *user_data);
 void db_models_each(db_model_cb cb, void *user_data);
 
 /* register a manually downloaded model (not in registry) */
@@ -75,15 +78,17 @@ int db_session_get(int session_id, struct db_session *out);
 
 /* --- messages --- */
 
-/* append a message to a session */
+/* append a message to a session. `model` is the alias of the model in effect
+   for this turn (NULL ok for user/system messages or legacy callers). */
 void db_message_add(int session_id, int seq, const char *role,
-                    const char *content, int llm_use);
+                    const char *content, const char *model, int llm_use);
 
 /* message info returned by load */
 struct db_message {
 	int seq;
 	char *role;
 	char *content;
+	char *model;   /* may be NULL */
 	int llm_use;
 };
 

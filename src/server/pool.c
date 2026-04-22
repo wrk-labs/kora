@@ -125,12 +125,23 @@ static int pick_free_port(void)
 static char *resolve_model_path(const char *model_name)
 {
 	const char *url = registry_lookup(model_name);
+	char fname_buf[256];
 	const char *filename;
 	if (url) {
 		const char *slash = strrchr(url, '/');
 		filename = slash ? slash + 1 : url;
 	} else {
-		filename = model_name;
+		/* manual / non-registry alias: db_model_add stores the alias
+		   with the trailing ".gguf" stripped, so we reconstruct here
+		   (mirror of main.c's resolve_model_path). */
+		size_t nlen = strlen(model_name);
+		int has_ext = (nlen >= 5 && strcmp(model_name + nlen - 5, ".gguf") == 0);
+		if (has_ext) {
+			filename = model_name;
+		} else {
+			snprintf(fname_buf, sizeof fname_buf, "%s.gguf", model_name);
+			filename = fname_buf;
+		}
 	}
 	if (strstr(filename, "..") || strchr(filename, '/')) return NULL;
 	char sub[512];

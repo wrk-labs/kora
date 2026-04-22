@@ -40,33 +40,58 @@ struct pull_args {
 	char target[256];
 };
 
+/* number of in-flight background downloads. bumped before dispatch, decremented
+   when bg_pull_fn exits. main thread reads it to decide whether to warn on
+   quit. download_cancel is polled by model.c's progress callback — setting
+   it to 1 aborts curl and triggers the .part unlink path. */
+static volatile int downloads_in_flight = 0;
+static volatile int download_cancel = 0;
+
 static void bg_pull_fn(void *arg)
 {
 	struct pull_args *pa = arg;
 
 	status_wire(STATUS_DOWNLOAD, NULL, NULL, 0);
 	model_set_progress_cb(bg_pull_progress_cb, NULL);
+	model_set_cancel_flag(&download_cancel);
+	/* publish the in-flight alias so the MODELS pane can render the
+	   ⟳ glyph on the matching row. URL pulls won't match any row, which
+	   is fine — the indicator just won't show. */
+	tui_set_downloading_alias(pa->target);
 	int rc = model_pull(pa->target);
+	tui_set_downloading_alias(NULL);
+	model_set_cancel_flag(NULL);
 	model_set_progress_cb(NULL, NULL);
 	status_unwire(STATUS_DOWNLOAD);
 
 	if (rc == 0) {
 		db_models_sync();
-		tui_info("");
-		tui_info("Download complete.");
+		tui_log("Download complete: %s", pa->target);
+		tui_post_models_refresh();   /* thread-safe; main loop redraws */
+	} else if (download_cancel) {
+		tui_log("Download cancelled: %s", pa->target);
+		tui_post_models_refresh();
 	} else {
-		tui_info("");
-		tui_info("Download failed.");
+		tui_log("Download failed: %s", pa->target);
+		tui_post_models_refresh();
 	}
 
+	/* clear the cancel flag so the next pull isn't aborted on the first
+	   progress tick. safe to reset here unconditionally: we've already
+	   branched on its value above, and dispatch_active() guarantees no
+	   overlapping worker is racing to read it. */
+	__atomic_store_n(&download_cancel, 0, __ATOMIC_SEQ_CST);
+	__atomic_sub_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
 	free(pa);
 }
 
 static void tui_model_table_cb(const char *alias, const char *filename,
                                const char *size, const char *quant,
-                               int downloaded, int active, void *user_data)
+                               int downloaded, int active,
+                               const char *display_name, void *user_data)
 {
 	(void)filename;
+	(void)display_name;
 	(void)user_data;
 	char buf[256];
 	snprintf(buf, sizeof(buf), "  %s%-18s  %5s  %-6s  %s",
@@ -98,6 +123,11 @@ struct gen_args {
 	char *model;
 	struct kora_message *msgs;   /* snapshot from kora_session_snapshot */
 	int n_msgs;
+	/* persistence: save the assistant reply to the DB the moment
+	   generation finishes, rather than deferring to the next main-loop
+	   iteration (which only runs when the user presses Enter again). */
+	int save_session_id;         /* -1 to skip */
+	int save_seq;
 };
 
 static void *gen_thread_fn(void *arg)
@@ -127,6 +157,16 @@ static void *gen_thread_fn(void *arg)
 
 	tui_assistant_end();
 	tui_statusbar(NULL);
+
+	/* persist the assistant response immediately. sqlite runs in its
+	   default serialized mode, so db_message_add is thread-safe. this
+	   ensures the reply survives a Ctrl-C right after reading it — the
+	   old path only saved when the user typed their next message. */
+	if (rc == 0 && response && *response &&
+	    ga->save_session_id >= 0)
+		db_message_add(ga->save_session_id, ga->save_seq,
+		               "assistant", response, ga->model, 1);
+
 	gen_response = response;
 
 	kora_session_snapshot_free(ga->msgs, ga->n_msgs);
@@ -134,6 +174,10 @@ static void *gen_thread_fn(void *arg)
 	free(ga->model);
 	free(ga);
 	generating = 0;
+	tui_set_cancellable(0);
+	/* let the main loop know a turn just completed so any queued follow-up
+	   message can be fired automatically without the user pressing a key. */
+	tui_post_wake();
 	return NULL;
 }
 
@@ -188,13 +232,10 @@ static void *compact_thread_fn(void *arg)
 		compact_summary = summary;
 		compact_before = ca->before_tokens;
 		int after = (int)(strlen(summary) / 4);
-		char msg[128];
-		snprintf(msg, sizeof msg, "Compacted: ~%d -> ~%d tokens",
-		         ca->before_tokens, after);
-		tui_info(""); tui_info(msg);
+		tui_log("Compacted: ~%d → ~%d tokens", ca->before_tokens, after);
 	} else {
 		free(summary);
-		tui_info(""); tui_info("Compaction failed.");
+		tui_log("Compaction failed.");
 	}
 
 	free(ca->base_url);
@@ -203,6 +244,7 @@ static void *compact_thread_fn(void *arg)
 	free(ca->compact_prompt);
 	free(ca);
 	compacting = 0;
+	tui_set_cancellable(0);
 	return NULL;
 }
 
@@ -313,13 +355,156 @@ static void update_context_status(const struct kora_session *session, int ctx_si
 {
 	int tokens = kora_session_approx_tokens(session);
 	if (ctx_size <= 0) {
-		status_set(STATUS_CONTEXT, "/help for commands");
+		status_set(STATUS_CONTEXT, NULL);
 		return;
 	}
 	char buf[128];
 	int pct = (int)((double)tokens / ctx_size * 100);
 	snprintf(buf, sizeof buf, "~%d/%d tokens (%d%%)", tokens, ctx_size, pct);
 	status_set(STATUS_CONTEXT, buf);
+}
+
+/* refresh the left pane with the latest session list from the DB. */
+static void refresh_sessions_pane(int active_id)
+{
+	struct db_session list[64];
+	int n = db_sessions_list(list, 64);
+	tui_set_sessions(list, n, active_id);
+}
+
+/* --- daemon-status background poller --- */
+
+static volatile int g_poller_stop = 0;
+
+struct poller_args {
+	char base_url[256];
+};
+
+static void *daemon_poller_fn(void *arg)
+{
+	struct poller_args *pa = arg;
+	int last = -1;
+	while (!g_poller_stop) {
+		int up = (kora_client_ping(pa->base_url) == 0);
+		if (up != last) {
+			tui_post_daemon_status(up);
+			/* skip the initial startup "transition" so we don't
+			   double-up with the "Daemon unreachable…" line the
+			   chat-branch prints right after init. */
+			if (last >= 0) tui_log(up ? "Daemon up." : "Daemon down.");
+			last = up;
+		}
+		/* sleep 2s in 100ms chunks so shutdown is responsive */
+		for (int i = 0; i < 20 && !g_poller_stop; i++) {
+			struct timespec ts = { 0, 100 * 1000 * 1000 };
+			nanosleep(&ts, NULL);
+		}
+	}
+	free(pa);
+	return NULL;
+}
+
+/* populate the right admin pane with registry models + downloaded flags.
+   downloaded (locally available) models are listed first so the user sees
+   what they can actually use without scrolling. */
+struct manual_probe_ctx {
+	struct tui_model_row *rows;
+	int *n;
+	int cap;
+	const char *current_model;
+};
+
+static void manual_models_cb(const char *alias, const char *filename,
+                             const char *size, const char *quant,
+                             int downloaded, int active,
+                             const char *display_name, void *user_data)
+{
+	(void)size; (void)quant; (void)active;
+	struct manual_probe_ctx *ctx = user_data;
+	if (!downloaded) return;
+	if (*ctx->n >= ctx->cap) return;
+	/* skip anything already emitted by the registry passes */
+	for (int i = 0; i < *ctx->n; i++) {
+		if (strcmp(ctx->rows[i].alias, alias) == 0) return;
+		if (filename && strcmp(ctx->rows[i].alias, filename) == 0) return;
+	}
+	snprintf(ctx->rows[*ctx->n].alias, sizeof ctx->rows[*ctx->n].alias, "%s", alias);
+	if (display_name && *display_name)
+		snprintf(ctx->rows[*ctx->n].display,
+		         sizeof ctx->rows[*ctx->n].display, "%s", display_name);
+	else
+		ctx->rows[*ctx->n].display[0] = '\0';
+	ctx->rows[*ctx->n].size[0]  = '\0';   /* unknown for manual */
+	ctx->rows[*ctx->n].quant[0] = '\0';
+	ctx->rows[*ctx->n].downloaded = 1;
+	ctx->rows[*ctx->n].is_current = (ctx->current_model &&
+	                                 strcmp(ctx->current_model, alias) == 0);
+	(*ctx->n)++;
+}
+
+static void refresh_models_pane(const char *current_model)
+{
+	struct tui_model_row rows[32];
+	memset(rows, 0, sizeof rows);   /* clears display[] so rows without
+	                                   a GGUF name fall back to alias */
+	int n = 0;
+
+	/* pass 1: downloaded registry models */
+	for (int i = 0; registry[i].alias && n < 32; i++) {
+		if (!db_model_is_downloaded(registry[i].alias)) continue;
+		snprintf(rows[n].alias, sizeof rows[n].alias, "%s", registry[i].alias);
+		snprintf(rows[n].size,  sizeof rows[n].size,  "%s", registry[i].size  ? registry[i].size  : "");
+		snprintf(rows[n].quant, sizeof rows[n].quant, "%s", registry[i].quant ? registry[i].quant : "");
+		rows[n].downloaded = 1;
+		rows[n].is_current = (current_model &&
+		                      strcmp(current_model, registry[i].alias) == 0);
+		n++;
+	}
+
+	/* pass 2: manually-downloaded (non-registry) models — anything that
+	   ended up in ~/.kora/models/ via a URL pull. db_models_sync has
+	   already added them to the DB with source='manual'. */
+	struct manual_probe_ctx ctx = {
+		.rows = rows, .n = &n, .cap = 32, .current_model = current_model,
+	};
+	db_models_each(manual_models_cb, &ctx);
+
+	/* pass 3: not-downloaded registry models (fetchable) */
+	for (int i = 0; registry[i].alias && n < 32; i++) {
+		if (db_model_is_downloaded(registry[i].alias)) continue;
+		snprintf(rows[n].alias, sizeof rows[n].alias, "%s", registry[i].alias);
+		snprintf(rows[n].size,  sizeof rows[n].size,  "%s", registry[i].size  ? registry[i].size  : "");
+		snprintf(rows[n].quant, sizeof rows[n].quant, "%s", registry[i].quant ? registry[i].quant : "");
+		rows[n].downloaded = 0;
+		rows[n].is_current = 0;
+		n++;
+	}
+
+	tui_set_models(rows, n);
+}
+
+/* refresh callback invoked by the TUI main loop when bg_pull_fn finishes.
+   reads current model from db so we don't need a thread-shared pointer. */
+static void refresh_models_pane_auto(void)
+{
+	const char *active = db_model_get_active();
+	refresh_models_pane(active);
+}
+
+/* update the header's displayed session name from the DB (if active). */
+static void refresh_session_header(const struct kora_session *s)
+{
+	if (!s || s->db_id < 0) {
+		tui_set_session_name("");
+		return;
+	}
+	struct db_session row;
+	if (db_session_get(s->db_id, &row) == 0 && row.name[0] &&
+	    strcmp(row.name, "New session") != 0) {
+		tui_set_session_name(row.name);
+	} else {
+		tui_set_session_name("(new)");
+	}
 }
 
 static void usage(void)
@@ -343,12 +528,25 @@ static void version(void)
 static char *resolve_model_path(const char *model_name)
 {
 	const char *url = registry_lookup(model_name);
+	char fname_buf[256];
 	const char *filename;
 	if (url) {
+		/* registry: file name comes from the URL's last segment. */
 		const char *slash = strrchr(url, '/');
 		filename = slash ? slash + 1 : url;
 	} else {
-		filename = model_name;
+		/* manual / non-registry alias: db_model_add stores the alias
+		   with the trailing ".gguf" stripped, so we reconstruct by
+		   appending it here. leave alone if the caller already passed
+		   a name ending in ".gguf" (edge case — e.g. typed manually). */
+		size_t nlen = strlen(model_name);
+		int has_ext = (nlen >= 5 && strcmp(model_name + nlen - 5, ".gguf") == 0);
+		if (has_ext) {
+			filename = model_name;
+		} else {
+			snprintf(fname_buf, sizeof fname_buf, "%s.gguf", model_name);
+			filename = fname_buf;
+		}
 	}
 	if (strstr(filename, "..") || strchr(filename, '/')) {
 		fprintf(stderr, "kora: invalid model name '%s'\n", model_name);
@@ -362,7 +560,7 @@ static char *resolve_model_path(const char *model_name)
 /* --- launch helpers: build args + spawn thread for gen/compact/naming --- */
 
 static int launch_gen(const char *base_url, const char *model,
-                      const struct kora_session *session)
+                      struct kora_session *session)
 {
 	struct kora_message *msgs = NULL;
 	int n = kora_session_snapshot(session, &msgs);
@@ -374,9 +572,15 @@ static int launch_gen(const char *base_url, const char *model,
 	ga->model    = strdup(model);
 	ga->msgs     = msgs;
 	ga->n_msgs   = n;
+	/* reserve the DB seq now so the worker can save without racing
+	   on session->msg_seq. the main loop's collection path then skips
+	   the DB call since it's already persisted. */
+	ga->save_session_id = session->db_id;
+	ga->save_seq        = session->msg_seq++;
 
 	gen_response = NULL;
 	generating = 1;
+	tui_set_cancellable(1);
 	tui_statusbar("generating... (esc to cancel)");
 	pthread_t tid;
 	pthread_create(&tid, NULL, gen_thread_fn, ga);
@@ -402,6 +606,7 @@ static int launch_compact(const char *base_url, const char *model,
 	ca->before_tokens  = before_tokens;
 
 	compacting = 1;
+	tui_set_cancellable(1);
 	pthread_t tid;
 	pthread_create(&tid, NULL, compact_thread_fn, ca);
 	pthread_detach(tid);
@@ -587,18 +792,63 @@ int main(int argc, char *argv[])
 
 		tui_init();
 		status_wire(STATUS_CONTEXT, NULL, NULL, 0);
-		tui_set_header("kora chat", current_model ? current_model : "no model");
+		tui_set_header("kora", current_model ? current_model : "no model");
+		tui_set_daemon_status(daemon_up);
+		tui_set_session_name("");
 		tui_draw();
 		tui_draw_welcome(NULL);
+		refresh_sessions_pane(session->db_id);
+		refresh_models_pane(current_model);
+		tui_set_models_refresh_cb(refresh_models_pane_auto);
+
+		/* background poller: ping daemon every 2s, push status to TUI.
+		   this is how the header dot reflects "daemon came up later". */
+		pthread_t poller_tid;
+		struct poller_args *pa = malloc(sizeof *pa);
+		snprintf(pa->base_url, sizeof pa->base_url, "%s", base_url);
+		g_poller_stop = 0;
+		pthread_create(&poller_tid, NULL, daemon_poller_fn, pa);
 
 		if (!daemon_up) {
-			tui_info("");
-			tui_info("Daemon not reachable at the configured base URL.");
-			tui_info("Start it with: kora serve <model>  (or via systemd --user)");
-			tui_info("");
+			tui_log("Daemon unreachable at %s — run: kora serve <model>", base_url);
 		}
 
 		update_context_status(session, cfg->ctx_size);
+
+		/* unbounded FIFO of pending user messages. if the user submits a
+		   chat turn while a generation is running, we append to this
+		   list instead of discarding with a "Busy" message. the bg thread
+		   calls tui_post_wake() when its turn ends; main.c sees the wake
+		   sentinel, pops the head of the queue, echoes it to chat, and
+		   runs the normal send path. Esc-cancel clears the entire queue
+		   — the user cancelled, they probably don't want a chain of
+		   surprise messages to fire after a deliberate abort. */
+		struct pending_msg { char *text; struct pending_msg *next; };
+		struct pending_msg *queue_head = NULL;
+		struct pending_msg *queue_tail = NULL;
+		int queue_count = 0;
+
+		/* refresh the statusbar indicator to reflect the current queue.
+		   the preview always shows the head (the one that'll fire next)
+		   truncated to keep the bottom bar compact. a leading count is
+		   prepended when more than one message is pending. */
+		#define QUEUE_REFRESH_INDICATOR() do { \
+			if (queue_count == 0) { \
+				tui_set_queued(NULL); \
+			} else { \
+				char _ind[120]; \
+				int  _full = (int)strlen(queue_head->text); \
+				int  _plen = _full > 40 ? 40 : _full; \
+				const char *_ellip = _full > 40 ? "…" : ""; \
+				if (queue_count == 1) \
+					snprintf(_ind, sizeof _ind, "↑ queued: %.*s%s", \
+					         _plen, queue_head->text, _ellip); \
+				else \
+					snprintf(_ind, sizeof _ind, "↑ %d queued: %.*s%s", \
+					         queue_count, _plen, queue_head->text, _ellip); \
+				tui_set_queued(_ind); \
+			} \
+		} while (0)
 
 		int running = 1;
 		while (running) {
@@ -607,10 +857,10 @@ int main(int argc, char *argv[])
 			/* collect completed background work */
 
 			if (!generating && gen_response) {
+				/* DB write already happened in gen_thread_fn — here we
+				   only mirror the response into the in-memory session
+				   so the next turn and the rendered pad stay in sync. */
 				kora_session_add(session, "assistant", gen_response);
-				if (session->db_id >= 0)
-					db_message_add(session->db_id, session->msg_seq++,
-					               "assistant", gen_response, 1);
 				free(gen_response);
 				gen_response = NULL;
 				update_context_status(session, cfg->ctx_size);
@@ -633,44 +883,301 @@ int main(int argc, char *argv[])
 				session->named = 1;
 				free(session_name_result);
 				session_name_result = NULL;
+				refresh_sessions_pane(session->db_id);
+				refresh_session_header(session);
 			}
 
 			if (!input) break;
+
+			/* wake sentinel: bg worker finished and wants the main loop
+			   to act. pop the head of the pending queue and fire it
+			   now that the channel is free. */
+			if (input[0] == '\x02') {
+				free(input);
+				if (queue_head && !generating && !compacting &&
+				    !naming_session && current_model) {
+					struct pending_msg *node = queue_head;
+					queue_head = node->next;
+					if (!queue_head) queue_tail = NULL;
+					queue_count--;
+					char *msg = node->text;
+					free(node);
+					QUEUE_REFRESH_INDICATOR();
+					/* synthesise the same fall-through the direct-send
+					   path takes: echo to chat, then goto the chat-send
+					   block with `input` set to the queued text. */
+					tui_user_msg(msg);
+					input = msg;
+					goto chat_send_path;
+				}
+				continue;
+			}
 
 			if (input[0] == '\0') {
 				if (generating) {
 					gen_cancel();
 					free(gen_response);
 					gen_response = NULL;
-					tui_info(""); tui_info("Generation cancelled.");
+					tui_log("Generation cancelled.");
 				}
 				if (compacting) {
 					compact_cancel();
 					free(compact_summary);
 					compact_summary = NULL;
-					tui_info(""); tui_info("Compaction cancelled.");
+					tui_log("Compaction cancelled.");
 				}
+				/* the user cancelled — assume they also want to abandon
+				   every queued follow-up. retyping is cheaper than having
+				   a chain of surprise messages fire after a deliberate
+				   cancel. */
+				while (queue_head) {
+					struct pending_msg *node = queue_head;
+					queue_head = node->next;
+					free(node->text);
+					free(node);
+				}
+				queue_tail = NULL;
+				queue_count = 0;
+				tui_set_queued(NULL);
 				free(input);
 				continue;
 			}
 
-			tui_user_msg(input);
 			tui_input_clear();
 
-			if (strcmp(input, "/exit") == 0 || strcmp(input, "exit") == 0 ||
-			    strcmp(input, "/quit") == 0 || strcmp(input, "quit") == 0) {
+			/* commands come from NORMAL-mode shortcuts, which encode them
+			   with a leading \x01 (SOH) marker. user-typed "/anything" in
+			   INSERT mode never has that byte, so it's a plain chat
+			   message. normalise the marker to '/' so the existing
+			   command-dispatch chain keeps working unchanged. */
+			int is_cmd = ((unsigned char)input[0] == 1);
+			if (is_cmd) input[0] = '/';
+
+			/* echo chat messages into the chat pad — but only when we'll
+			   actually send them now. if we're busy (generation in flight)
+			   the message goes to the queue instead of the chat pad, and
+			   chat_send_path's busy branch handles the echo-once-sent
+			   bookkeeping via tui_set_queued(). */
+			if (!is_cmd && !generating && !compacting && !naming_session)
+				tui_user_msg(input);
+
+			if (!is_cmd) {
+				/* not a command — skip the slash-dispatch chain entirely
+				   and fall straight through to the chat-send branch.
+				   typed slashes are just message content. */
+				goto chat_send_path;
+			}
+
+			if (strcmp(input, "/exit") == 0 ||
+			    strcmp(input, "/quit") == 0) {
+				int n_dl = __atomic_load_n(&downloads_in_flight, __ATOMIC_SEQ_CST);
+				if (n_dl > 0) {
+					char prompt[128];
+					snprintf(prompt, sizeof prompt,
+					         "Download in progress — cancel and quit?");
+					int ans = tui_permission(prompt);
+					if (ans != 'y') {
+						/* user declined; keep running */
+						free(input);
+						continue;
+					}
+					/* signal the download thread to abort; spin-wait until
+					   it unwinds so the .part file gets unlinked before
+					   the process exits. */
+					__atomic_store_n(&download_cancel, 1, __ATOMIC_SEQ_CST);
+					tui_log("Cancelling download…");
+					while (__atomic_load_n(&downloads_in_flight,
+					                        __ATOMIC_SEQ_CST) > 0) {
+						struct timespec ts = {0, 50 * 1000 * 1000};
+						nanosleep(&ts, NULL);
+					}
+					__atomic_store_n(&download_cancel, 0, __ATOMIC_SEQ_CST);
+				}
 				gen_cancel();
 				compact_cancel();
 				free(input);
 				running = 0;
 			} else if (strcmp(input, "/help") == 0) {
-				tui_info("/help           Show this message");
-				tui_info("/model <name>   Switch to a different model");
-				tui_info("/pull <name>    Download a model");
-				tui_info("/compact        Summarize conversation to free context");
-				tui_info("/clear          Clear conversation history");
-				tui_info("/resume         Resume or manage previous sessions");
-				tui_info("/exit           Quit chat");
+				if (generating || compacting || naming_session) {
+					tui_info("Busy. Press Esc to cancel first.");
+					free(input);
+					continue;
+				}
+				/* debounce: prevent help spam */
+				static time_t last_help_time = 0;
+				time_t now = time(NULL);
+				if (now - last_help_time < 2) {
+					free(input);
+					continue;
+				}
+				last_help_time = now;
+				tui_info("────────────────────────────────────────");
+				tui_info("Help:");
+				tui_info("Global:");
+				tui_info("  Tab            Cycle focus forward (SESSIONS → CHAT → MODELS)");
+				tui_info("  Shift+Tab      Cycle focus backward");
+				tui_info("  Esc            Cancel: generation, or command entry (r/m/p)");
+				tui_info("  Ctrl-C         Quit kora");
+				tui_info("CHAT:");
+				tui_info("  type + Enter   Send message");
+				tui_info("  Alt+Enter      Insert newline");
+				tui_info("  Alt+H          Show help");
+				tui_info("SESSIONS:");
+				tui_info("  j / k          Highlight next / previous session");
+				tui_info("  Enter          Open highlighted session");
+				tui_info("  n              New session");
+				tui_info("  d              Delete highlighted session");
+				tui_info("  r              Rename highlighted session (type the new name)");
+				tui_info("Note: context auto-compacts when > 75% full. No manual command.");
+				tui_info("MODELS:");
+				tui_info("  j / k          Highlight next / previous model");
+				tui_info("  Enter          Switch to highlighted model");
+				tui_info("  p              Pull the highlighted model");
+				tui_info("  u              Pull a model by URL (prompts)");
+				tui_info("  d              Remove the highlighted model (or cancel its download)");
+				tui_info("────────────────────────────────────────");
+				free(input);
+			} else if (strcmp(input, "/open") == 0) {
+				/* open the session highlighted in the SESSIONS pane */
+				if (generating || compacting || naming_session) {
+					tui_info("Busy. Press Esc to cancel current task first.");
+				} else {
+					int sid = tui_highlighted_session_id();
+					if (sid < 0) {
+						tui_info("No session highlighted.");
+					} else if (sid == session->db_id) {
+						/* already open — just focus CHAT */
+						tui_focus_chat();
+					} else {
+						kora_session_clear(session);
+						struct db_message *msgs = NULL;
+						int nm = db_messages_load(sid, &msgs);
+						session->msg_seq = 0;
+						session->user_msg_count = 0;
+						for (int i = 0; i < nm; i++) {
+							if (!msgs[i].llm_use) continue;
+							if (strcmp(msgs[i].role, "system") == 0) continue;
+							kora_session_add(session, msgs[i].role, msgs[i].content);
+							if (strcmp(msgs[i].role, "user") == 0)
+								session->user_msg_count++;
+							if (msgs[i].seq > session->msg_seq)
+								session->msg_seq = msgs[i].seq;
+						}
+						session->msg_seq++;
+						db_messages_free(msgs, nm);
+
+						struct db_session info;
+						int named = 0;
+						if (db_session_get(sid, &info) == 0)
+							named = info.name[0] != '\0' &&
+							        strcmp(info.name, "New session") != 0;
+						session->db_id = sid;
+						session->named = named;
+
+						refresh_sessions_pane(session->db_id);
+						refresh_session_header(session);
+						tui_draw();
+						tui_draw_welcome(current_model);
+						for (int j = 0; j < session->n_msg; j++) {
+							if (strcmp(session->roles[j], "system") == 0) continue;
+							if (strcmp(session->roles[j], "user") == 0) {
+								tui_user_msg(session->contents[j]);
+							} else {
+								tui_assistant_begin();
+								tui_assistant_chunk(session->contents[j], 0);
+								tui_assistant_end();
+							}
+						}
+						update_context_status(session, cfg->ctx_size);
+						tui_focus_chat();
+					}
+				}
+				free(input);
+			} else if (strcmp(input, "/model_switch") == 0) {
+				const char *alias = tui_highlighted_model_alias();
+				if (!alias) {
+					tui_info("No model highlighted.");
+				} else if (!valid_model_name(alias)) {
+					tui_info("Invalid model name.");
+				} else if (generating || compacting || naming_session) {
+					tui_info("Busy. Press Esc to cancel current task first.");
+				} else {
+					char *new_path = resolve_model_path(alias);
+					if (!new_path || !model_exists(new_path)) {
+						tui_log("Model not downloaded: %s. Press 'p' in MODELS pane to fetch it.", alias);
+						free(new_path);
+					} else {
+						free(new_path);
+						free(current_model);
+						current_model = strdup(alias);
+						/* in-session swap: keep the transcript and DB row;
+						   subsequent turns get tagged with the new model on
+						   save, and the daemon routes to the right child via
+						   the `model` field in each request. */
+						kora_session_set_model(session, current_model);
+						kora_set_preferred_model(current_model);
+						db_model_set_active(current_model);
+						tui_set_header("kora", current_model);
+
+						tui_log("Switched to %s (continues current session).",
+						        current_model);
+						refresh_models_pane(current_model);
+						refresh_session_header(session);
+						update_context_status(session, cfg->ctx_size);
+						tui_focus_chat();
+					}
+				}
+				free(input);
+			} else if (strcmp(input, "/model_pull") == 0) {
+				const char *alias = tui_highlighted_model_alias();
+				if (!alias) {
+					tui_info("No model highlighted.");
+				} else if (dispatch_active()) {
+					tui_info("A background task is already running.");
+				} else {
+					struct pull_args *pa = malloc(sizeof *pa);
+					snprintf(pa->target, sizeof pa->target, "%s", alias);
+					tui_log("Downloading %s…", alias);
+					__atomic_add_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
+					dispatch(bg_pull_fn, pa);
+				}
+				free(input);
+			} else if (strcmp(input, "/model_cancel") == 0) {
+				/* fired when the user presses 'x' on a row that's
+				   currently being pulled. flags the worker; curl's
+				   progress callback returns 1 on the next tick and the
+				   .part file gets unlinked in model.c. we don't wait
+				   here — the pane refresh happens when bg_pull_fn
+				   exits and posts tui_post_models_refresh(). */
+				int n_dl = __atomic_load_n(&downloads_in_flight, __ATOMIC_SEQ_CST);
+				if (n_dl <= 0) {
+					tui_info("Nothing is downloading.");
+				} else {
+					__atomic_store_n(&download_cancel, 1, __ATOMIC_SEQ_CST);
+					tui_log("Cancelling download…");
+				}
+				free(input);
+			} else if (strcmp(input, "/model_rm") == 0) {
+				const char *alias = tui_highlighted_model_alias();
+				if (!alias) {
+					tui_info("No model highlighted.");
+				} else if (!valid_model_name(alias)) {
+					tui_info("Invalid model name.");
+				} else if (current_model && strcmp(alias, current_model) == 0) {
+					tui_info("Can't remove the active model. Switch first.");
+				} else if (!db_model_is_downloaded(alias)) {
+					tui_log("Model not downloaded: %s", alias);
+				} else {
+					int rc = model_rm(alias);
+					if (rc == 0) {
+						tui_log("Removed %s from disk.", alias);
+						db_models_sync();
+						refresh_models_pane(current_model);
+					} else {
+						tui_log("Remove failed: %s", alias);
+					}
+					tui_input_clear();
+				}
 				free(input);
 			} else if (strncmp(input, "/resume", 7) == 0) {
 				if (generating || compacting || naming_session) {
@@ -693,14 +1200,15 @@ int main(int argc, char *argv[])
 								session->msg_seq = 0;
 								session->user_msg_count = 0;
 								session->named = 0;
+								tui_clear_chat();
 							}
 							db_session_delete(del_id);
-							tui_info("Session deleted.");
+							tui_log("Session deleted.");
+							tui_input_clear();
 						}
 					} else if (ns == 0) {
 						tui_info("No previous sessions.");
 					} else if (*arg == '\0') {
-						tui_info("");
 						tui_info("  #  Name                      Date           Msgs  Last message");
 						tui_info("  ──────────────────────────────────────────────────────────────────");
 						for (int i = 0; i < ns; i++) {
@@ -734,10 +1242,8 @@ int main(int argc, char *argv[])
 								strlen(sessions[i].last_message) > 30 ? "..." : "");
 							tui_info(line);
 						}
-						tui_info("");
 						tui_info("  /resume <#>       Resume a session");
 						tui_info("  /resume rm <#>    Delete a session");
-						tui_info("");
 					} else {
 						int sel = parse_positive_int(arg);
 						if (sel < 1 || sel > ns) {
@@ -769,14 +1275,13 @@ int main(int argc, char *argv[])
 							session->named = sessions[idx].name[0] != '\0' &&
 								strcmp(sessions[idx].name, "New session") != 0;
 
+							refresh_sessions_pane(session->db_id);
+							refresh_session_header(session);
 							tui_draw();
 							tui_draw_welcome(current_model);
 
-							char resume_msg[256];
-							snprintf(resume_msg, sizeof(resume_msg),
-								"Resumed session: %s", sessions[idx].name);
-							tui_info(resume_msg);
-							tui_info("");
+							tui_log("Resumed session: %s", sessions[idx].name);
+							tui_input_clear();
 
 							for (int j = 0; j < session->n_msg; j++) {
 								if (strcmp(session->roles[j], "system") == 0) continue;
@@ -794,31 +1299,6 @@ int main(int argc, char *argv[])
 					}
 				}
 				free(input);
-			} else if (strcmp(input, "/clear") == 0) {
-				kora_session_clear(session);
-				tui_draw();
-				tui_draw_welcome(current_model);
-				tui_info("Conversation cleared.");
-				session->db_id = -1;
-				session->msg_seq = 0;
-				session->user_msg_count = 0;
-				session->named = 0;
-				update_context_status(session, cfg->ctx_size);
-				free(input);
-			} else if (strcmp(input, "/compact") == 0) {
-				if (!current_model) {
-					tui_info("No model selected. Use /model <name>.");
-				} else if (generating || compacting || naming_session) {
-					tui_info("Busy. Press ESC to cancel current task first.");
-				} else if (session->n_msg <=
-				           (cfg->system_chat ? 1 : 0)) {
-					tui_info("Nothing to compact.");
-				} else {
-					launch_compact(base_url, current_model, session,
-					               cfg->compact_chat,
-					               kora_session_approx_tokens(session));
-				}
-				free(input);
 			} else if (strncmp(input, "/model", 6) == 0) {
 				const char *new_name = input + 6;
 				while (*new_name == ' ') new_name++;
@@ -827,14 +1307,11 @@ int main(int argc, char *argv[])
 					snprintf(model_msg, sizeof(model_msg), "Current model: %s",
 						current_model ? current_model : "(none)");
 					tui_info(model_msg);
-					tui_info("");
 					tui_info("  Models:");
 					tui_info("  ──────────────────────────────────────────────────────────");
 					db_models_each(tui_model_table_cb, NULL);
-					tui_info("");
 					tui_info("  /model <name>    Switch model (daemon loads on next request)");
 					tui_info("  /pull <name>     Download a model");
-					tui_info("");
 				} else if (!valid_model_name(new_name)) {
 					tui_info("Invalid model name. Use alphanumeric, hyphens, dots, underscores.");
 				} else if (generating || compacting || naming_session) {
@@ -853,7 +1330,7 @@ int main(int argc, char *argv[])
 						kora_session_set_model(session, current_model);
 						kora_set_preferred_model(current_model);
 						db_model_set_active(current_model);
-						tui_set_header("kora chat", current_model);
+						tui_set_header("kora", current_model);
 
 						kora_session_clear(session);
 						session->db_id = -1;
@@ -861,13 +1338,150 @@ int main(int argc, char *argv[])
 						session->user_msg_count = 0;
 						session->named = 0;
 
-						char msg[256];
-						snprintf(msg, sizeof msg,
-						         "Switched to %s (daemon will load on next request).",
-						         current_model);
-						tui_info(msg);
+						tui_log("Switched to %s (daemon will load on next request).",
+						        current_model);
+						refresh_models_pane(current_model);
+						refresh_sessions_pane(-1);
+						refresh_session_header(session);
 						update_context_status(session, cfg->ctx_size);
 					}
+				}
+				free(input);
+			} else if (strcmp(input, "/next") == 0 ||
+			           strcmp(input, "/prev") == 0) {
+				int forward = (strcmp(input, "/next") == 0);
+				if (generating || compacting || naming_session) {
+					tui_info("Busy. Press ESC to cancel current task first.");
+				} else {
+					struct db_session sl[64];
+					int ns = db_sessions_list(sl, 64);
+					if (ns == 0) {
+						tui_info("No sessions to switch to.");
+					} else {
+						/* find current session's index; if not found (new/unsaved),
+						   default to just past the end so next→0 / prev→last */
+						int cur_idx = -1;
+						for (int i = 0; i < ns; i++)
+							if (sl[i].id == session->db_id) { cur_idx = i; break; }
+
+						int target;
+						if (cur_idx < 0) {
+							target = forward ? 0 : ns - 1;
+						} else {
+							target = forward ? (cur_idx + 1) % ns
+							                 : (cur_idx - 1 + ns) % ns;
+						}
+
+						int sid = sl[target].id;
+						if (sid == session->db_id) {
+							tui_info("Only one session.");
+						} else {
+							/* reuse /resume N code path */
+							kora_session_clear(session);
+							struct db_message *msgs = NULL;
+							int nm = db_messages_load(sid, &msgs);
+							session->msg_seq = 0;
+							session->user_msg_count = 0;
+							for (int i = 0; i < nm; i++) {
+								if (!msgs[i].llm_use) continue;
+								if (strcmp(msgs[i].role, "system") == 0) continue;
+								kora_session_add(session,
+								                 msgs[i].role, msgs[i].content);
+								if (strcmp(msgs[i].role, "user") == 0)
+									session->user_msg_count++;
+								if (msgs[i].seq > session->msg_seq)
+									session->msg_seq = msgs[i].seq;
+							}
+							session->msg_seq++;
+							db_messages_free(msgs, nm);
+
+							session->db_id = sid;
+							session->named = sl[target].name[0] != '\0' &&
+								strcmp(sl[target].name, "New session") != 0;
+
+							refresh_sessions_pane(session->db_id);
+							refresh_session_header(session);
+							tui_draw();
+							tui_draw_welcome(current_model);
+							tui_log("Switched to: %s",
+							        sl[target].name[0] ? sl[target].name : "New session");
+							for (int j = 0; j < session->n_msg; j++) {
+								if (strcmp(session->roles[j], "system") == 0) continue;
+								if (strcmp(session->roles[j], "user") == 0) {
+									tui_user_msg(session->contents[j]);
+								} else {
+									tui_assistant_begin();
+									tui_assistant_chunk(session->contents[j], 0);
+									tui_assistant_end();
+								}
+							}
+							update_context_status(session, cfg->ctx_size);
+						}
+					}
+				}
+				free(input);
+			} else if (strcmp(input, "/new") == 0) {
+				if (generating || compacting || naming_session) {
+					tui_info("Busy. Press ESC to cancel current task first.");
+				} else {
+					kora_session_clear(session);
+					session->db_id = -1;
+					session->msg_seq = 0;
+					session->user_msg_count = 0;
+					session->named = 0;
+					tui_draw();
+					tui_draw_welcome(current_model);
+					tui_log("New session.");
+					refresh_sessions_pane(-1);
+					refresh_session_header(session);
+					update_context_status(session, cfg->ctx_size);
+					tui_input_clear();
+				}
+				free(input);
+			} else if (strncmp(input, "/rename", 7) == 0) {
+				const char *name = input + 7;
+				while (*name == ' ') name++;
+				int target_id = tui_highlighted_session_id();
+				if (*name == '\0') {
+					tui_info("Usage: highlight a session and type the new name.");
+				} else if (target_id < 0) {
+					tui_info("No session highlighted.");
+				} else if (strlen(name) > 120) {
+					tui_info("Name too long (max 120 chars).");
+				} else {
+					db_session_set_name(target_id, name);
+					if (target_id == session->db_id)
+						session->named = 1;
+					tui_log("Renamed to: %s", name);
+					refresh_sessions_pane(session->db_id);
+					refresh_session_header(session);
+					tui_input_clear();
+				}
+				free(input);
+			} else if (strcmp(input, "/delete") == 0) {
+				int del_id = tui_highlighted_session_id();
+				if (del_id < 0) {
+					tui_info("No session highlighted.");
+				} else if (generating || compacting || naming_session) {
+					tui_info("Busy. Press Esc to cancel current task first.");
+				} else {
+					db_session_delete(del_id);
+					/* if we deleted the session currently open in the
+					   chat pane, reset its state */
+					if (del_id == session->db_id) {
+						kora_session_clear(session);
+						session->db_id = -1;
+						session->msg_seq = 0;
+						session->user_msg_count = 0;
+						session->named = 0;
+						tui_clear_chat();
+						tui_draw_welcome(current_model);
+					}
+					tui_log("Session deleted.");
+					refresh_sessions_pane(session->db_id);
+					refresh_session_header(session);
+					update_context_status(session, cfg->ctx_size);
+					tui_input_clear();
 				}
 				free(input);
 			} else if (strncmp(input, "/pull", 5) == 0) {
@@ -882,22 +1496,39 @@ int main(int argc, char *argv[])
 				} else {
 					struct pull_args *pa = malloc(sizeof(*pa));
 					snprintf(pa->target, sizeof(pa->target), "%s", target);
-					char msg[256];
-					snprintf(msg, sizeof msg, "Downloading %s in background...", target);
-					tui_info(msg);
+					tui_log("Downloading %s…", target);
+					__atomic_add_fetch(&downloads_in_flight, 1, __ATOMIC_SEQ_CST);
 					dispatch(bg_pull_fn, pa);
 				}
 				free(input);
-			} else if (input[0] == '/') {
+			} else {
+				/* unknown command (marker was set but we didn't recognise it) */
 				char err_msg[256];
-				snprintf(err_msg, sizeof err_msg, "Unknown command: %s (type /help)", input);
+				snprintf(err_msg, sizeof err_msg, "Unknown command: %s", input);
 				tui_info(err_msg);
 				free(input);
-			} else if (generating || compacting || naming_session) {
-				tui_info("Busy. Press ESC to cancel.");
+				continue;
+			}
+			continue;  /* command branch handled; skip chat path */
+
+chat_send_path:
+			if (generating || compacting || naming_session) {
+				/* append to the FIFO. the head fires first when the
+				   current op finishes; subsequent entries fire as each
+				   generation completes. */
+				struct pending_msg *node = malloc(sizeof *node);
+				if (node) {
+					node->text = strdup(input);
+					node->next = NULL;
+					if (queue_tail) queue_tail->next = node;
+					else            queue_head = node;
+					queue_tail = node;
+					queue_count++;
+					QUEUE_REFRESH_INDICATOR();
+				}
 				free(input);
 			} else if (!current_model) {
-				tui_info("No model selected. Use /model <name> first.");
+				tui_info("No model selected. Press 'm' in NORMAL mode first.");
 				free(input);
 			} else {
 				if (session->db_id < 0) {
@@ -905,6 +1536,8 @@ int main(int argc, char *argv[])
 					if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
 					session->db_id = db_session_create("chat",
 						current_model ? current_model : "", cwd);
+					refresh_sessions_pane(session->db_id);
+					refresh_session_header(session);
 				}
 
 				kora_session_add(session, "user", input);
@@ -912,23 +1545,27 @@ int main(int argc, char *argv[])
 
 				if (session->db_id >= 0)
 					db_message_add(session->db_id, session->msg_seq++,
-					               "user", input, 1);
+					               "user", input, current_model, 1);
 
 				int tok = kora_session_approx_tokens(session);
 				update_context_status(session, cfg->ctx_size);
 
 				if (ctx_needs_compression(tok, cfg->ctx_size) && !compacting) {
-					tui_info("Context approaching limit; compacting in background...");
+					tui_log("Context approaching limit; compacting in background…");
 					launch_compact(base_url, current_model, session,
 					               cfg->compact_chat, tok);
 				}
 
 				if (launch_gen(base_url, current_model, session) != 0)
-					tui_info("Out of memory.");
+					tui_log("Out of memory.");
 
 				free(input);
 			}
 		}
+
+		/* signal + join the daemon poller */
+		g_poller_stop = 1;
+		pthread_join(poller_tid, NULL);
 
 		gen_cancel();
 		compact_cancel();
@@ -940,6 +1577,12 @@ int main(int argc, char *argv[])
 		free(gen_response);     gen_response = NULL;
 		free(compact_summary);  compact_summary = NULL;
 		free(session_name_result); session_name_result = NULL;
+		while (queue_head) {
+			struct pending_msg *node = queue_head;
+			queue_head = node->next;
+			free(node->text);
+			free(node);
+		}
 
 		tui_cleanup();
 		kora_session_free(session);
