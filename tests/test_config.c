@@ -55,7 +55,19 @@ static void test_defaults_when_no_user_config(void)
 	ASSERT(cfg != NULL);
 	EXPECT_STREQ(cfg->default_model, "llama-3.2-3b");
 	EXPECT_EQ(cfg->ctx_size, 4096);
+	EXPECT_EQ(cfg->markdown, 1);
 	EXPECT(cfg->chat_model == NULL);
+	kora_config_free(cfg);
+	TEST_END();
+}
+
+static void test_markdown_toggle_off(void)
+{
+	TEST_BEGIN("markdown = false in user config disables post-render styling");
+	write_user_config("return { markdown = false }\n");
+	struct kora_config *cfg = kora_config_load("lua");
+	ASSERT(cfg != NULL);
+	EXPECT_EQ(cfg->markdown, 0);
 	kora_config_free(cfg);
 	TEST_END();
 }
@@ -129,6 +141,7 @@ int main(void)
 	test_partial_config_keeps_defaults_for_missing_fields();
 	test_empty_config_table_is_safe();
 	test_malformed_config_falls_back_to_defaults();
+	test_markdown_toggle_off();
 
 	teardown_tmp_home();
 	return TEST_REPORT();

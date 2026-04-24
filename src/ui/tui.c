@@ -14,6 +14,7 @@
 
 #include "db.h"
 #include "event.h"
+#include "markdown.h"
 #include "status.h"
 #include "tui.h"
 
@@ -139,6 +140,7 @@ static void refresh_synth_row(void)
 #define KAI_BRIGHTWHITE 25  /* #eeeeee */
 #define KAI_HIGHLIGHT   26  /* #2a2a2a */
 #define KAI_BORDER      27  /* #333333 */
+#define KAI_PROSE_BG    28  /* #1a1a1a — subtle assistant-message tint */
 
 /* color pairs */
 #define CP_FG            1
@@ -150,6 +152,14 @@ static void refresh_synth_row(void)
 #define CP_ASSISTANT     7   /* white — assistant messages */
 #define CP_DAEMON_UP     8   /* green — daemon reachable */
 #define CP_DAEMON_DOWN   9   /* red   — daemon unreachable */
+/* markdown styling — block / inline decorations for assistant post-render.
+   kept in a contiguous range so the future syntax-highlighting palette can
+   start at CP_SYNTAX_BASE without colliding. */
+#define CP_MD_HEADING    10  /* magenta — h1/h2/h3 (bg = prose tint) */
+#define CP_MD_CODE_INLINE 11 /* cyan — inline `code` (bg = prose tint) */
+#define CP_MD_CODE_BLOCK 12  /* cyan dim — fenced code blocks (darker bg) */
+#define CP_MD_QUOTE      13  /* dim — blockquote text (bg = prose tint) */
+#define CP_MD_PROSE      14  /* white on prose tint — baseline assistant text */
 
 static int colors_available = 0;
 /* deprecated alias kept so the render paths compile while we finish theming */
@@ -1415,6 +1425,13 @@ static void render_info(const char *text);
 static void render_assistant_begin(void);
 static void render_assistant_chunk(const char *text, int len);
 static void render_assistant_end(void);
+static void render_assistant_styled(const char *text);
+
+/* toggled by main.c via tui_set_markdown; when off, assistant replies are
+   rendered as plain text (the pre-markdown behaviour). declared here so
+   chat_log_replay and the event handlers can reach it before the markdown
+   renderer is defined. */
+static int markdown_enabled = 1;
 
 static void chat_log_replay(void)
 {
@@ -1430,8 +1447,11 @@ static void chat_log_replay(void)
 			break;
 		case CLK_ASSISTANT:
 			render_assistant_begin();
-			render_assistant_chunk(chat_log[i].text,
-			                       (int)strlen(chat_log[i].text));
+			if (markdown_enabled)
+				render_assistant_styled(chat_log[i].text);
+			else
+				render_assistant_chunk(chat_log[i].text,
+				                       (int)strlen(chat_log[i].text));
 			render_assistant_end();
 			break;
 		case CLK_INFO:
@@ -1528,6 +1548,319 @@ static void render_assistant_end(void)
 	refresh_chat();
 }
 
+/* --- markdown post-render for assistant messages ---
+   On tui_assistant_end the full message is pushed to chat_log and a replay
+   is triggered. Replay routes assistant entries through this path, which
+   parses the markdown once and paints styled spans. Streaming (chunk-by-
+   chunk) still uses render_assistant_chunk above — we can't parse partial
+   markdown reliably, so the pad flashes raw text live and styles it when
+   the stream closes. */
+
+struct md_pad {
+	int   at_line_start;   /* cursor at col 0 — need leading indent */
+	int   in_quote;        /* inside blockquote — dim text */
+	int   in_code;         /* inside fenced block — different styling */
+	int   in_header_cell;  /* inside a <th> — bold cell content */
+	int   list_depth;      /* for nested bullet indent */
+	int   heading_attrs;   /* active ncurses attrs for the open heading */
+	char  code_lang[32];
+};
+
+static int heading_attrs_for_level(int level)
+{
+	/* differentiate h1/h2/h3+ so a nested outline isn't a wall of bold. */
+	int a = COLOR_PAIR(CP_MD_HEADING);
+	if (level <= 1)      a |= A_BOLD | A_UNDERLINE;
+	else if (level == 2) a |= A_BOLD;
+	/* level >= 3: plain colour */
+	return a;
+}
+
+/* Resolve inline attrs to a single ncurses attribute word. Color pairs
+   are exclusive (ncurses holds only one pair per char), so we pick the
+   right pair based on context and combine it with bold/underline bits. */
+static int md_inline_attrs(int kmd_attrs, int in_quote)
+{
+	int pair;
+	if (kmd_attrs & KMD_ATTR_CODE_INLINE) pair = CP_MD_CODE_INLINE;
+	else if (in_quote)                     pair = CP_MD_QUOTE;
+	else                                    pair = CP_MD_PROSE;
+
+	int a = COLOR_PAIR(pair);
+	if (kmd_attrs & KMD_ATTR_BOLD)   a |= A_BOLD;
+	/* A_ITALIC isn't portable — A_UNDERLINE reads well on most terms */
+	if (kmd_attrs & KMD_ATTR_ITALIC) a |= A_UNDERLINE;
+	if (in_quote && !(kmd_attrs & KMD_ATTR_CODE_INLINE)) a |= A_DIM;
+	return a;
+}
+
+static void md_indent(struct md_pad *p)
+{
+	if (p->at_line_start) {
+		/* plain 2-space outdent — the prose bg starts at col 2, so
+		   every assistant line has a narrow untinted left margin (same
+		   shape as code blocks). matches render_assistant_begin which
+		   also writes this gutter without attrs. */
+		waddstr(win_chat, "  ");
+		p->at_line_start = 0;
+	}
+}
+
+/* Advance to the next row. Every assistant row has the shape:
+     cols [0..1]   plain (untinted gutter, matches code-block layout)
+     cols [2..cols-1]  prose bg
+
+   If the cursor is already on a fresh auto-wrapped row (x < 2), we write
+   the plain gutter first so "empty" rows (paragraph breaks, spacers) keep
+   the same left margin as content rows instead of tinting all the way to
+   col 0. Padding to exactly `cols` chars relies on ncurses auto-wrap to
+   advance the cursor — same trick as code rows, no explicit '\n'. */
+static void md_newline(struct md_pad *p)
+{
+	int y, x;
+	getyx(win_chat, y, x);
+	(void)y;
+	int cols = getmaxx(win_chat);
+
+	if (x < 2) {
+		/* fresh row — lay down the untinted gutter before tinting the rest. */
+		waddstr(win_chat, "  ");
+		x = 2;
+	}
+
+	int pad = cols - x;
+	if (pad > 0) {
+		wattron(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		for (int i = 0; i < pad; i++) waddch(win_chat, ' ');
+		wattroff(win_chat, COLOR_PAIR(CP_MD_PROSE));
+	}
+	p->at_line_start = 1;
+}
+
+/* Emit one line of a fenced code block padded out to the pane's right
+   edge so the block reads as a uniform rectangle. The leading "  " of the
+   assistant gutter is written plain; everything from the code-inset "  "
+   onward is filled with CP_MD_CODE_BLOCK background, including trailing
+   padding. We write exactly `cols` characters — ncurses' auto-wrap then
+   advances the cursor to the next row. Adding an explicit '\n' on top of
+   that produces a double-spaced block (was: the v1 bug). */
+static void md_emit_code_row(struct md_pad *p, const char *text, int len)
+{
+	md_indent(p);
+	int cols = getmaxx(win_chat);
+	/* cursor is now at column 2 (post gutter). code inset + text + pad
+	   must fill the remaining `cols - 2` columns. */
+	int pad = cols - 2 /* gutter */ - 2 /* code inset */ - len;
+	if (pad < 0) pad = 0;
+	wattron(win_chat, COLOR_PAIR(CP_MD_CODE_BLOCK));
+	if (len > 0)
+		wprintw(win_chat, "  %.*s%*s", len, text, pad, "");
+	else
+		wprintw(win_chat, "  %*s", pad, "");
+	wattroff(win_chat, COLOR_PAIR(CP_MD_CODE_BLOCK));
+	/* auto-wrap moves the cursor to the next row — same pattern as
+	   render_user_msg. if the line didn't fill cols (impossibly narrow
+	   terminal), the next md_indent + at_line_start check handles it. */
+	p->at_line_start = 1;
+}
+
+static void md_emit_text(struct md_pad *p, int attrs,
+                         const char *text, size_t len)
+{
+	/* split on explicit '\n' first, then wrap each segment manually so
+	   continuation lines keep the assistant's 2-space gutter. ncurses'
+	   native auto-wrap would drop at col 0 of the next row and break the
+	   left margin — visible as "strange padding" on long replies. */
+	const char *start = text;
+	size_t remaining = len;
+	int a = md_inline_attrs(attrs, p->in_quote);
+
+	while (remaining > 0) {
+		const char *nl = memchr(start, '\n', remaining);
+		size_t seg = nl ? (size_t)(nl - start) : remaining;
+
+		const char *s = start;
+		size_t r = seg;
+		while (r > 0) {
+			md_indent(p);
+			int cur_y, cur_x;
+			getyx(win_chat, cur_y, cur_x);
+			(void)cur_y;
+			int cols = getmaxx(win_chat);
+			/* leave the rightmost column for md_newline's bg pad so
+			   we never trigger auto-wrap mid-attr. */
+			int avail = cols - cur_x - 1;
+			if (avail <= 0) {
+				md_newline(p);
+				continue;
+			}
+
+			size_t write_n = r <= (size_t)avail ? r : (size_t)avail;
+
+			/* soft word-wrap: if we'd cut mid-word and there's a
+			   space earlier in the chunk, break on it instead. */
+			if (write_n < r) {
+				size_t j = write_n;
+				while (j > 0 && s[j] != ' ') j--;
+				if (j > 0) write_n = j + 1;  /* include the space */
+			}
+
+			wattron(win_chat, a);
+			waddnstr(win_chat, s, (int)write_n);
+			wattroff(win_chat, a);
+			s += write_n;
+			r -= write_n;
+			if (r > 0) md_newline(p);
+		}
+
+		if (nl) {
+			md_newline(p);
+			start    = nl + 1;
+			remaining -= seg + 1;
+		} else {
+			break;
+		}
+	}
+}
+
+static void md_cb(int kind, int attrs, int level,
+                  const char *text, size_t len, void *user)
+{
+	struct md_pad *p = user;
+
+	switch (kind) {
+	case KMD_TEXT:
+		md_emit_text(p, attrs, text, len);
+		break;
+
+	case KMD_HARD_BREAK:
+		md_newline(p);
+		break;
+
+	case KMD_PARAGRAPH_BREAK:
+		if (!p->at_line_start) md_newline(p);
+		md_newline(p);   /* one blank line between blocks */
+		break;
+
+	case KMD_HEADING_BEGIN:
+		if (!p->at_line_start) md_newline(p);
+		md_indent(p);
+		p->heading_attrs = heading_attrs_for_level(level);
+		wattron(win_chat, p->heading_attrs);
+		break;
+
+	case KMD_HEADING_END:
+		wattroff(win_chat, p->heading_attrs);
+		p->heading_attrs = 0;
+		md_newline(p);
+		break;
+
+	case KMD_CODE_BLOCK_BEGIN:
+		if (!p->at_line_start) md_newline(p);
+		p->in_code = 1;
+		size_t n = len < sizeof p->code_lang - 1 ? len : sizeof p->code_lang - 1;
+		if (n) memcpy(p->code_lang, text, n);
+		p->code_lang[n] = '\0';
+		/* leading blank row with the code-block background so the block
+		   reads as a framed container rather than per-line ribbons. */
+		md_emit_code_row(p, "", 0);
+		break;
+
+	case KMD_CODE_BLOCK_LINE:
+		md_emit_code_row(p, text, (int)len);
+		break;
+
+	case KMD_CODE_BLOCK_END:
+		/* matching trailing blank row so the bottom of the block is a
+		   clean rectangle like the top. */
+		md_emit_code_row(p, "", 0);
+		p->in_code = 0;
+		p->code_lang[0] = '\0';
+		break;
+
+	case KMD_LIST_ITEM_BEGIN: {
+		if (!p->at_line_start) md_newline(p);
+		md_indent(p);
+		wattron(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		for (int i = 1; i < level; i++) waddstr(win_chat, "  ");
+		waddstr(win_chat, "• ");
+		wattroff(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		p->at_line_start = 0;
+		p->list_depth = level;
+		break;
+	}
+
+	case KMD_LIST_ITEM_END:
+		if (!p->at_line_start) md_newline(p);
+		break;
+
+	case KMD_BLOCKQUOTE_BEGIN:
+		if (!p->at_line_start) md_newline(p);
+		p->in_quote = 1;
+		break;
+
+	case KMD_BLOCKQUOTE_END:
+		p->in_quote = 0;
+		break;
+
+	case KMD_TABLE_BEGIN:
+		if (!p->at_line_start) md_newline(p);
+		break;
+
+	case KMD_TABLE_END:
+		/* trailing blank is handled by the next block's PARA event. */
+		break;
+
+	case KMD_TABLE_ROW_BEGIN:
+		md_indent(p);
+		wattron(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		waddstr(win_chat, "| ");
+		wattroff(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		p->at_line_start = 0;
+		break;
+
+	case KMD_TABLE_ROW_END:
+		md_newline(p);
+		break;
+
+	case KMD_TABLE_CELL_BEGIN:
+		if (level > 0) {
+			p->in_header_cell = 1;
+			wattron(win_chat, A_BOLD);
+		}
+		break;
+
+	case KMD_TABLE_CELL_END:
+		if (p->in_header_cell) {
+			wattroff(win_chat, A_BOLD);
+			p->in_header_cell = 0;
+		}
+		wattron(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		waddstr(win_chat, " | ");
+		wattroff(win_chat, COLOR_PAIR(CP_MD_PROSE));
+		break;
+	}
+}
+
+static void render_assistant_styled(const char *text)
+{
+	if (!win_chat || !text) return;
+	chat_pad_ensure();
+
+	struct md_pad p = { .at_line_start = 1 };
+	/* the assistant message already has a leading "\n  " from
+	   render_assistant_begin; we start at column 0 of that line with the
+	   2-space indent pending. */
+	p.at_line_start = 0;  /* begin already wrote "  " */
+
+	int rc = kora_markdown_parse(text, strlen(text), md_cb, &p);
+	if (rc != 0) {
+		/* parse failed — fall back to plain rendering so the user never
+		   loses the message content. */
+		waddnstr(win_chat, text, (int)strlen(text));
+	}
+}
+
 static void render_info(const char *text)
 {
 	if (!win_chat) return;
@@ -1592,6 +1925,12 @@ static void drain_events(void)
 				assistant_pending_reset();
 			}
 			render_assistant_end();
+			/* with markdown enabled, replay the whole log so the just-
+			   pushed entry is re-rendered through the styled path. replay
+			   is idempotent (already used on resize) — cost is one full
+			   pad repaint per completed message. */
+			if (markdown_enabled)
+				chat_log_replay();
 			break;
 		case TUI_EV_USER_MSG:
 			chat_log_push(CLK_USER, ev.data ? ev.data : "");
@@ -1936,6 +2275,7 @@ void tui_init(void)
 			init_color(KAI_BRIGHTWHITE, 933,  933,  933);   /* #eeeeee */
 			init_color(KAI_HIGHLIGHT,   165,  165,  165);   /* #2a2a2a */
 			init_color(KAI_BORDER,      200,  200,  200);   /* #333333 */
+			init_color(KAI_PROSE_BG,    102,  102,  102);   /* #1a1a1a */
 
 			init_pair(CP_FG,          KAI_WHITE,       -1);
 			init_pair(CP_ACCENT,      KAI_ORANGE,      -1);
@@ -1946,6 +2286,11 @@ void tui_init(void)
 			init_pair(CP_ASSISTANT,   KAI_WHITE,       -1);
 			init_pair(CP_DAEMON_UP,   KAI_GREEN,       -1);
 			init_pair(CP_DAEMON_DOWN, KAI_RED,         -1);
+			init_pair(CP_MD_HEADING,    KAI_MAGENTA,   KAI_PROSE_BG);
+			init_pair(CP_MD_CODE_INLINE, KAI_CYAN,     KAI_PROSE_BG);
+			init_pair(CP_MD_CODE_BLOCK, KAI_CYAN,      KAI_HIGHLIGHT);
+			init_pair(CP_MD_QUOTE,      KAI_DIM,       KAI_PROSE_BG);
+			init_pair(CP_MD_PROSE,      KAI_WHITE,     KAI_PROSE_BG);
 		} else {
 			/* fallback: use standard 16-color slots */
 			init_pair(CP_FG,          COLOR_WHITE,   -1);
@@ -1957,6 +2302,14 @@ void tui_init(void)
 			init_pair(CP_ASSISTANT,   COLOR_WHITE,   -1);
 			init_pair(CP_DAEMON_UP,   COLOR_GREEN,   -1);
 			init_pair(CP_DAEMON_DOWN, COLOR_RED,     -1);
+			/* fallback terminals can't define custom colours — so the prose
+			   bg stays at terminal default. code blocks still get a visible
+			   tint via ANSI 8 (bright black / gray). */
+			init_pair(CP_MD_HEADING,    COLOR_MAGENTA, -1);
+			init_pair(CP_MD_CODE_INLINE, COLOR_CYAN,   -1);
+			init_pair(CP_MD_CODE_BLOCK, COLOR_CYAN,    8);
+			init_pair(CP_MD_QUOTE,      8,             -1);
+			init_pair(CP_MD_PROSE,      COLOR_WHITE,   -1);
 		}
 		user_msg_attr = A_BOLD | COLOR_PAIR(CP_USER);
 	}
@@ -2442,6 +2795,11 @@ void tui_assistant_end(void)
 	struct tui_event ev = {0};
 	ev.type = TUI_EV_CHAT_END;
 	event_push(&ev);
+}
+
+void tui_set_markdown(int enabled)
+{
+	markdown_enabled = enabled ? 1 : 0;
 }
 
 void tui_statusbar(const char *text)

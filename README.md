@@ -11,6 +11,7 @@ Kora runs large language models entirely on your machine — no cloud, no API ke
 - **Model management** — download, list, switch, cancel-in-progress, and remove GGUF models; URL pulls show up as a selectable row with the same cancel gesture
 - **Session management** — create, open, rename, delete, auto-titled in the background once a conversation has some substance; persisted in SQLite and resumable across runs
 - **Automatic context compaction** — when the running context hits ~75% of the model's window, Kora summarises older turns in the background and continues without interruption
+- **Markdown rendering** — assistant replies are re-styled with bold / italic / inline code / headings / lists / blockquotes / fenced code blocks once the stream finishes (via vendored md4c)
 - **Non-blocking UI** — generation, compaction, and downloads all run on background threads; the pane stays responsive
 - **Scrollable chat** — mouse-wheel scroll in the chat pane
 - **GPU acceleration** — automatic VRAM detection and layer offloading via the vendored llama.cpp
@@ -107,6 +108,23 @@ All data lives under `~/.kora/`:
 └── kora.db         # sessions, messages, model catalog, settings (SQLite)
 ```
 
+### Markdown rendering
+
+Assistant replies stream as plain text live, and once the stream finishes
+the completed message is re-parsed and re-painted with styling:
+
+- `**bold**`, `*italic*`, `` `inline code` ``
+- `#`/`##`/`###` headings (orange + bold)
+- `- item` bullet lists with nested-depth indent
+- `> quoted text` blockquotes (dim)
+- ```` ```lang ```` fenced code blocks (cyan on a dim background; the
+  language tag is recognised but syntax highlighting is a planned follow-up)
+
+Parsing uses the vendored [md4c](https://github.com/mity/md4c) library
+(CommonMark + GitHub-flavoured extensions, minus HTML/tables). Disable
+with `markdown = false` in `~/.kora/config.lua` if a particular model
+emits malformed markdown and the styled output is noisier than useful.
+
 ### System prompt
 
 The system prompt lives in `lua/core/system.lua` as a template. Kora
@@ -140,7 +158,7 @@ kora/
 ├── lua/            # Lua configuration (system prompts, user config template)
 │   └── core/
 ├── tests/          # unit tests — one binary per module, `make test` runs all
-├── vendor/         # llama.cpp, Lua 5.5 (vendored)
+├── vendor/         # llama.cpp, Lua 5.5, md4c (vendored)
 ├── Makefile
 ├── config.mk
 └── README.md
@@ -164,9 +182,10 @@ make clean-all        # also wipe vendored llama.cpp and lua builds
 ```
 
 Tests live under `tests/` — one binary per module (`test_registry`,
-`test_session`, `test_client`, `test_db`, `test_config`) — and use a tiny
-harness in `tests/test.h`. DB / config tests sandbox themselves under
-`/tmp` via `mkdtemp` and never touch your real `~/.kora/`.
+`test_session`, `test_client`, `test_db`, `test_config`, `test_prompt`,
+`test_markdown`) — and use a tiny harness in `tests/test.h`. DB / config
+tests sandbox themselves under `/tmp` via `mkdtemp` and never touch your
+real `~/.kora/`.
 
 ## Known issues
 

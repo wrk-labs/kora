@@ -785,6 +785,7 @@ int main(int argc, char *argv[])
 		}
 
 		tui_init();
+		tui_set_markdown(cfg->markdown);
 		status_wire(STATUS_CONTEXT, NULL, NULL, 0);
 		tui_set_header("kora", current_model ? current_model : "no model");
 		tui_set_daemon_status(daemon_up);

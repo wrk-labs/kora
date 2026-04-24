@@ -30,6 +30,11 @@ void tui_assistant_chunk(const char *text, int len);
 /* end the current assistant message (finalize + newline) */
 void tui_assistant_end(void);
 
+/* toggle markdown post-render styling for assistant messages. default on.
+   when off, replies are rendered as plain text (no bold/italic/code pairs,
+   no list bullets, no code-block colouring). safe to change at any time. */
+void tui_set_markdown(int enabled);
+
 /* print a system/info message (e.g. /help output) — lands in the chat
    pad. use sparingly; prefer tui_log for operational events so the chat
    stays focused on user ↔ assistant turns. */

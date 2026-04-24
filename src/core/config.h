@@ -7,6 +7,7 @@ struct kora_config {
 	char *system_chat;
 	char *compact_chat;
 	int ctx_size;
+	int markdown;          /* 1 = post-render assistant replies, 0 = plain */
 };
 
 struct kora_config *kora_config_load(const char *luadir);

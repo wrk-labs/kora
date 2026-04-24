@@ -1,3 +1,6 @@
 [submodule "vendor/llama.cpp"]
 	path = vendor/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "vendor/md4c"]
+	path = vendor/md4c
+	url = https://github.com/mity/md4c.git

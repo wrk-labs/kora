@@ -26,6 +26,14 @@ static int lua_getfield_int(lua_State *L, int idx, const char *key, int def)
 	return val;
 }
 
+static int lua_getfield_bool(lua_State *L, int idx, const char *key, int def)
+{
+	lua_getfield(L, idx, key);
+	int val = lua_isboolean(L, -1) ? lua_toboolean(L, -1) : def;
+	lua_pop(L, 1);
+	return val;
+}
+
 struct kora_config *kora_config_load(const char *luadir)
 {
 	struct kora_config *cfg = calloc(1, sizeof(*cfg));
@@ -37,6 +45,7 @@ struct kora_config *kora_config_load(const char *luadir)
 	cfg->system_chat = NULL;
 	cfg->compact_chat = NULL;
 	cfg->ctx_size = 4096;
+	cfg->markdown = 1;
 
 	lua_State *L = luaL_newstate();
 	if (!L)
@@ -64,6 +73,7 @@ struct kora_config *kora_config_load(const char *luadir)
 		s = lua_getfield_str(L, -1, "chat_model");
 		if (s) { free(cfg->chat_model); cfg->chat_model = s; }
 		cfg->ctx_size = lua_getfield_int(L, -1, "ctx_size", cfg->ctx_size);
+		cfg->markdown = lua_getfield_bool(L, -1, "markdown", cfg->markdown);
 		lua_pop(L, 1);
 	}
 	free(cfgpath);
