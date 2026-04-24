@@ -107,6 +107,26 @@ All data lives under `~/.kora/`:
 └── kora.db         # sessions, messages, model catalog, settings (SQLite)
 ```
 
+### System prompt
+
+The system prompt lives in `lua/core/system.lua` as a template. Kora
+renders it at session start and substitutes a small set of placeholders
+so the model has current environmental context:
+
+```
+{date}      e.g. "Friday, April 24, 2026"
+{time}      local time + UTC offset, e.g. "10:01 -03"
+{platform}  lowercase uname, e.g. "darwin" / "linux"
+{model}     current model alias, e.g. "llama-3.2-3b"
+{ctx}       configured context-window size in tokens
+```
+
+Unknown placeholders are left verbatim so typos are visible. Mid-session
+model swaps (via the `MODELS` pane) append a short `[Model changed from X
+to Y.]` system-role event to the transcript rather than rewriting the
+top-level prompt — this lets the model see the swap as a concrete turn
+in its history.
+
 ## Architecture
 
 ```

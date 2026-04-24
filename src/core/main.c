@@ -11,6 +11,7 @@
 #include "dispatch.h"
 #include "input.h"
 #include "model.h"
+#include "prompt.h"
 #include "registry.h"
 #include "server.h"
 #include "session.h"
@@ -358,6 +359,22 @@ static void update_context_status(const struct kora_session *session, int ctx_si
 	int pct = (int)((double)tokens / ctx_size * 100);
 	snprintf(buf, sizeof buf, "~%d/%d tokens (%d%%)", tokens, ctx_size, pct);
 	status_set(STATUS_CONTEXT, buf);
+}
+
+/* append a short system-role event marking a mid-conversation model swap.
+   the startup system prompt is left alone — this is just a signal in the
+   transcript so the model (and anyone reading DB history) can see the swap
+   happened. */
+static void notice_model_switch(struct kora_session *s,
+                                const char *from, const char *to)
+{
+	if (!s || !to || !*to) return;
+	char msg[256];
+	if (from && *from)
+		snprintf(msg, sizeof msg, "[Model changed from `%s` to `%s`.]", from, to);
+	else
+		snprintf(msg, sizeof msg, "[Model changed to `%s`.]", to);
+	kora_session_add(s, "system", msg);
 }
 
 /* refresh the left pane with the latest session list from the DB. */
@@ -751,9 +768,14 @@ int main(int argc, char *argv[])
 		const char *base_url = daemon_base_url();
 		int daemon_up = (kora_client_ping(base_url) == 0);
 
-		/* session holds the active conversation state */
+		/* session holds the active conversation state. render the
+		   system-prompt template with the current env (date/time/model/
+		   ctx/platform) before installing it on the session. */
+		char *initial_sys = kora_prompt_render(cfg->system_chat,
+		                                       current_model, cfg->ctx_size);
 		struct kora_session *session =
-			kora_session_new(current_model, cfg->system_chat);
+			kora_session_new(current_model, initial_sys);
+		free(initial_sys);
 		if (!session) {
 			fprintf(stderr, "kora: out of memory\n");
 			free(current_model);
@@ -1091,7 +1113,9 @@ int main(int argc, char *argv[])
 						free(new_path);
 					} else {
 						free(new_path);
-						free(current_model);
+						/* capture the outgoing alias before we overwrite it
+						   — the in-history swap notice wants both sides. */
+						char *old_model = current_model;
 						current_model = strdup(alias);
 						/* in-session swap: keep the transcript and DB row;
 						   subsequent turns get tagged with the new model on
@@ -1101,6 +1125,12 @@ int main(int argc, char *argv[])
 						kora_set_preferred_model(current_model);
 						db_model_set_active(current_model);
 						tui_set_header("kora", current_model);
+
+						/* leave the top-level system prompt alone; append a
+						   short system-role event so the transcript (and the
+						   model) sees the swap. */
+						notice_model_switch(session, old_model, current_model);
+						free(old_model);
 
 						tui_log("Switched to %s (continues current session).",
 						        current_model);

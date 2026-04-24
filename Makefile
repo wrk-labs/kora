@@ -4,7 +4,7 @@ VERSION = 0.1.0
 UNAME_S := $(shell uname -s)
 
 SRC_C = src/core/main.c src/core/util.c src/core/db.c src/core/dispatch.c \
-        src/core/config.c \
+        src/core/config.c src/core/prompt.c \
         src/llm/client.c src/llm/model.c src/llm/registry.c \
         src/server/server.c src/server/pool.c \
         src/ui/tui.c src/ui/input.c src/ui/event.c src/ui/status.c \
@@ -111,7 +111,7 @@ clean-all: clean
 # exit status aborts the run. no external test framework — tests/test.h is
 # a 50-line harness.
 TEST_SRC = tests/test_registry.c tests/test_session.c tests/test_client.c \
-           tests/test_db.c tests/test_config.c
+           tests/test_db.c tests/test_config.c tests/test_prompt.c
 TEST_BINS = $(TEST_SRC:.c=)
 TEST_OBJ = $(TEST_SRC:.c=.o)
 
@@ -131,6 +131,9 @@ tests/test_db: tests/test_db.o src/core/db.o src/core/util.o \
 	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
 
 tests/test_config: tests/test_config.o src/core/config.o src/core/util.o $(LUA_LIB)
+	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
+
+tests/test_prompt: tests/test_prompt.o src/core/prompt.o
 	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
 
 tests/%.o: tests/%.c
