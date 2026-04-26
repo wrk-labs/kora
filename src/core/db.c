@@ -38,6 +38,64 @@ static void db_lock_init(void)
 /* schema embedded at compile time from src/sql/schema.sql */
 #include "schema_sql.h"
 
+/* --- schema migrations ---
+   schema.sql defines the head state — fresh DBs jump straight to it.
+   migrations[] is append-only: index i is the SQL to take an existing
+   DB from version i to i+1. tracked via PRAGMA user_version. */
+static const char *migrations[] = {
+	/* v0 -> v1: pre-registry models gain a display_name column. */
+	"ALTER TABLE models ADD COLUMN display_name TEXT;",
+	/* v1 -> v2: messages get a status column so we can mark turns
+	   that failed mid-dispatch (e.g. daemon down) and skip them in
+	   future context loads. */
+	"ALTER TABLE messages ADD COLUMN status TEXT DEFAULT 'ok';",
+};
+#define MIGRATIONS_HEAD ((int)(sizeof migrations / sizeof migrations[0]))
+
+static int db_user_version(void)
+{
+	sqlite3_stmt *st;
+	int v = 0;
+	if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &st, NULL) == SQLITE_OK) {
+		if (sqlite3_step(st) == SQLITE_ROW)
+			v = sqlite3_column_int(st, 0);
+		sqlite3_finalize(st);
+	}
+	return v;
+}
+
+static void db_set_user_version(int v)
+{
+	char buf[64];
+	snprintf(buf, sizeof buf, "PRAGMA user_version = %d;", v);
+	sqlite3_exec(db, buf, NULL, NULL, NULL);
+}
+
+static int db_run_migrations(int from)
+{
+	for (int i = from; i < MIGRATIONS_HEAD; i++) {
+		char *err = NULL;
+		int rc = sqlite3_exec(db, migrations[i], NULL, NULL, &err);
+		if (rc != SQLITE_OK) {
+			/* legacy DBs from before user_version was tracked may have
+			   already received some of these ALTERs via the old ad-hoc
+			   path that ignored "duplicate column" errors. treat that
+			   specific failure as already-applied so we can advance
+			   user_version and move on to the next migration. */
+			int already = err && strstr(err, "duplicate column") != NULL;
+			if (!already) {
+				fprintf(stderr, "kora: migration %d -> %d failed: %s\n",
+				        i, i + 1, err ? err : "(unknown)");
+				sqlite3_free(err);
+				return -1;
+			}
+			sqlite3_free(err);
+		}
+		db_set_user_version(i + 1);
+	}
+	return 0;
+}
+
 static int has_suffix(const char *str, const char *suffix)
 {
 	size_t slen = strlen(str);
@@ -73,7 +131,22 @@ int db_open(void)
 	}
 	free(path);
 
-	/* create tables if they don't exist */
+	/* fresh-vs-existing detection has to happen before schema.sql runs,
+	   because CREATE TABLE IF NOT EXISTS is silent either way. fresh DBs
+	   skip the migration runner entirely (schema.sql is already at HEAD)
+	   and just stamp user_version; existing DBs run pending migrations. */
+	int fresh = 1;
+	{
+		sqlite3_stmt *st;
+		if (sqlite3_prepare_v2(db,
+		    "SELECT count(*) FROM sqlite_master WHERE type='table';",
+		    -1, &st, NULL) == SQLITE_OK) {
+			if (sqlite3_step(st) == SQLITE_ROW)
+				fresh = sqlite3_column_int(st, 0) == 0;
+			sqlite3_finalize(st);
+		}
+	}
+
 	if (sqlite3_exec(db, (const char *)schema_sql_data, NULL, NULL, &err) != SQLITE_OK) {
 		fprintf(stderr, "kora: schema error: %s\n", err);
 		sqlite3_free(err);
@@ -81,12 +154,12 @@ int db_open(void)
 		goto out;
 	}
 
-	/* incremental migrations: ALTER TABLE ADD COLUMN is idempotent-unfriendly
-	   (fails with "duplicate column" when already present), so we rely on
-	   the error being non-fatal and ignore it here. */
-	sqlite3_exec(db,
-		"ALTER TABLE models ADD COLUMN display_name TEXT;",
-		NULL, NULL, NULL);
+	if (fresh) {
+		db_set_user_version(MIGRATIONS_HEAD);
+	} else if (db_run_migrations(db_user_version()) != 0) {
+		rc = -1;
+		goto out;
+	}
 
 	/* WAL mode for better concurrency */
 	sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
@@ -631,12 +704,38 @@ out:
 	DB_UNLOCK();
 }
 
-int db_messages_load(int session_id, struct db_message **out)
+void db_message_set_status(int session_id, int seq, const char *status)
+{
+	sqlite3_stmt *stmt;
+
+	DB_LOCK();
+	if (!db || !status) goto out;
+
+	const char *sql =
+		"UPDATE messages SET status = ? "
+		"WHERE session_id = ? AND seq = ?;";
+
+	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		goto out;
+
+	sqlite3_bind_text(stmt, 1, status, -1, SQLITE_STATIC);
+	sqlite3_bind_int (stmt, 2, session_id);
+	sqlite3_bind_int (stmt, 3, seq);
+	sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+
+out:
+	DB_UNLOCK();
+}
+
+static int db_messages_load_where(int session_id, const char *extra_where,
+                                   struct db_message **out)
 {
 	sqlite3_stmt *stmt;
 	int count = 0;
 	int cap = 64;
 	struct db_message *msgs;
+	char sql[256];
 
 	DB_LOCK();
 
@@ -645,9 +744,10 @@ int db_messages_load(int session_id, struct db_message **out)
 	msgs = malloc(cap * sizeof(*msgs));
 	if (!msgs) { *out = NULL; goto done; }
 
-	const char *sql =
-		"SELECT seq, role, content, model, llm_use FROM messages "
-		"WHERE session_id = ? ORDER BY seq ASC;";
+	snprintf(sql, sizeof sql,
+		"SELECT seq, role, content, model, llm_use, status FROM messages "
+		"WHERE session_id = ? %s ORDER BY seq ASC;",
+		extra_where ? extra_where : "");
 
 	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
 		free(msgs);
@@ -668,10 +768,12 @@ int db_messages_load(int session_id, struct db_message **out)
 		const char *r = (const char *)sqlite3_column_text(stmt, 1);
 		const char *c = (const char *)sqlite3_column_text(stmt, 2);
 		const char *m = (const char *)sqlite3_column_text(stmt, 3);
+		const char *s = (const char *)sqlite3_column_text(stmt, 5);
 		msgs[count].role = r ? strdup(r) : strdup("");
 		msgs[count].content = c ? strdup(c) : strdup("");
 		msgs[count].model = m ? strdup(m) : NULL;
 		msgs[count].llm_use = sqlite3_column_int(stmt, 4);
+		msgs[count].status = strdup(s ? s : "ok");
 		count++;
 	}
 	sqlite3_finalize(stmt);
@@ -682,6 +784,19 @@ done:
 	return count;
 }
 
+int db_messages_load(int session_id, struct db_message **out)
+{
+	return db_messages_load_where(session_id, NULL, out);
+}
+
+int db_messages_load_for_context(int session_id, struct db_message **out)
+{
+	/* exclude rows that didn't complete a full turn (e.g. user msg whose
+	   dispatch failed). NULL status from old rows is treated as 'ok'. */
+	return db_messages_load_where(session_id,
+		"AND (status IS NULL OR status = 'ok')", out);
+}
+
 void db_messages_free(struct db_message *msgs, int count)
 {
 	int i;
@@ -690,6 +805,7 @@ void db_messages_free(struct db_message *msgs, int count)
 		free(msgs[i].role);
 		free(msgs[i].content);
 		free(msgs[i].model);
+		free(msgs[i].status);
 	}
 	free(msgs);
 }

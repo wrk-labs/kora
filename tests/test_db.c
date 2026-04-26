@@ -2,6 +2,7 @@
 #include "db.h"
 #include "util.h"
 
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -104,6 +105,216 @@ static void test_session_delete_cascades_to_messages(void)
 	TEST_END();
 }
 
+static void test_message_status_default_and_set(void)
+{
+	TEST_BEGIN("messages default to status 'ok'; db_message_set_status flips to 'failed'");
+	ASSERT(db_open() == 0);
+
+	int sid = db_session_create("chat", "m", NULL);
+	EXPECT(sid > 0);
+	db_message_add(sid, 0, "user", "hi", "m", 1);
+
+	struct db_message *msgs = NULL;
+	int n = db_messages_load(sid, &msgs);
+	EXPECT_EQ(n, 1);
+	ASSERT(msgs != NULL);
+	EXPECT_STREQ(msgs[0].status, "ok");
+	db_messages_free(msgs, n);
+
+	db_message_set_status(sid, 0, "failed");
+
+	msgs = NULL;
+	n = db_messages_load(sid, &msgs);
+	EXPECT_EQ(n, 1);
+	ASSERT(msgs != NULL);
+	EXPECT_STREQ(msgs[0].status, "failed");
+	db_messages_free(msgs, n);
+
+	db_close();
+	TEST_END();
+}
+
+static void test_messages_load_for_context_filters_failed(void)
+{
+	TEST_BEGIN("db_messages_load_for_context excludes failed rows");
+	ASSERT(db_open() == 0);
+
+	int sid = db_session_create("chat", "m", NULL);
+	db_message_add(sid, 0, "user",      "good question",   "m", 1);
+	db_message_add(sid, 1, "assistant", "good answer",     "m", 1);
+	db_message_add(sid, 2, "user",      "dispatch failed", "m", 1);
+	db_message_set_status(sid, 2, "failed");
+	db_message_add(sid, 3, "user",      "later turn",      "m", 1);
+
+	struct db_message *all = NULL;
+	int n_all = db_messages_load(sid, &all);
+	EXPECT_EQ(n_all, 4);   /* full loader still returns everything */
+	db_messages_free(all, n_all);
+
+	struct db_message *ctx = NULL;
+	int n_ctx = db_messages_load_for_context(sid, &ctx);
+	EXPECT_EQ(n_ctx, 3);   /* failed row is filtered */
+	ASSERT(ctx != NULL);
+	EXPECT_STREQ(ctx[0].content, "good question");
+	EXPECT_STREQ(ctx[1].content, "good answer");
+	EXPECT_STREQ(ctx[2].content, "later turn");
+	db_messages_free(ctx, n_ctx);
+
+	db_close();
+	TEST_END();
+}
+
+static void test_message_status_survives_reopen(void)
+{
+	TEST_BEGIN("message status round-trips through close+reopen");
+	ASSERT(db_open() == 0);
+	int sid = db_session_create("chat", "m", NULL);
+	db_message_add(sid, 0, "user",      "lost message", "m", 1);
+	db_message_add(sid, 1, "assistant", "ok",           "m", 1);
+	db_message_set_status(sid, 0, "failed");
+	db_close();
+
+	ASSERT(db_open() == 0);
+	struct db_message *msgs = NULL;
+	int n = db_messages_load(sid, &msgs);
+	EXPECT_EQ(n, 2);
+	ASSERT(msgs != NULL);
+	EXPECT_STREQ(msgs[0].status, "failed");
+	EXPECT_STREQ(msgs[1].status, "ok");
+	db_messages_free(msgs, n);
+	db_close();
+	TEST_END();
+}
+
+/* simulate a v0 DB (pre-migration-system) opened by the current binary.
+   the migration runner should bring it forward to HEAD without losing data
+   and existing rows should pick up the column default ('ok'). */
+static void test_migrations_upgrade_legacy_db(void)
+{
+	TEST_BEGIN("legacy DB without status column upgrades to current schema");
+
+	/* hand-craft a minimal pre-migration DB at the path db_open() will
+	   reopen. only the bits the migration touches need to exist. */
+	char *path = kora_path("kora.db");
+	ASSERT(path != NULL);
+	unlink(path);
+
+	sqlite3 *raw = NULL;
+	ASSERT(sqlite3_open(path, &raw) == SQLITE_OK);
+
+	const char *legacy =
+		"CREATE TABLE models ("
+		"  alias TEXT PRIMARY KEY, filename TEXT, url TEXT,"
+		"  size TEXT, quant TEXT, downloaded INTEGER DEFAULT 0,"
+		"  active INTEGER DEFAULT 0, source TEXT DEFAULT 'registry');"
+		"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);"
+		"CREATE TABLE sessions ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  name TEXT DEFAULT 'New session',"
+		"  mode TEXT NOT NULL DEFAULT 'chat',"
+		"  model TEXT, cwd TEXT,"
+		"  created_at TEXT DEFAULT (datetime('now')),"
+		"  updated_at TEXT DEFAULT (datetime('now')));"
+		"CREATE TABLE messages ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+		"  seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,"
+		"  model TEXT, llm_use INTEGER DEFAULT 1,"
+		"  created_at TEXT DEFAULT (datetime('now')));"
+		"INSERT INTO sessions (id, mode) VALUES (1, 'chat');"
+		"INSERT INTO messages (session_id, seq, role, content, model, llm_use)"
+		"  VALUES (1, 0, 'user', 'pre-migration', 'm', 1);"
+		"PRAGMA user_version = 0;";
+	char *err = NULL;
+	ASSERT(sqlite3_exec(raw, legacy, NULL, NULL, &err) == SQLITE_OK);
+	sqlite3_close(raw);
+	free(path);
+
+	/* now reopen via db_open — the runner should bring this forward. */
+	ASSERT(db_open() == 0);
+
+	/* the user_version should be at HEAD (whatever migrations[] length is). */
+	int v = -1;
+	sqlite3_stmt *st;
+	ASSERT(sqlite3_prepare_v2(db_handle(), "PRAGMA user_version;",
+	                          -1, &st, NULL) == SQLITE_OK);
+	if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
+	sqlite3_finalize(st);
+	EXPECT(v >= 2);   /* at least v2 (status column) */
+
+	/* the pre-existing user message should still be there with default status. */
+	struct db_message *msgs = NULL;
+	int n = db_messages_load(1, &msgs);
+	EXPECT_EQ(n, 1);
+	ASSERT(msgs != NULL);
+	EXPECT_STREQ(msgs[0].content, "pre-migration");
+	EXPECT_STREQ(msgs[0].status,  "ok");
+	db_messages_free(msgs, n);
+
+	/* second open is a no-op: already at HEAD, no migration runs. */
+	db_close();
+	ASSERT(db_open() == 0);
+	db_close();
+
+	TEST_END();
+}
+
+/* legacy DBs from before user_version was tracked may already have
+   the v0->v1 ALTER applied (display_name) while still reporting
+   user_version=0. the runner must tolerate "duplicate column" errors
+   in this case and still advance to HEAD. */
+static void test_migrations_tolerate_already_applied_alters(void)
+{
+	TEST_BEGIN("legacy DB with display_name already added still upgrades to HEAD");
+
+	char *path = kora_path("kora.db");
+	ASSERT(path != NULL);
+	unlink(path);
+
+	sqlite3 *raw = NULL;
+	ASSERT(sqlite3_open(path, &raw) == SQLITE_OK);
+
+	/* note: models has display_name already (mirroring the post-ad-hoc-ALTER
+	   state of real legacy DBs), but user_version is still 0. */
+	const char *legacy =
+		"CREATE TABLE models ("
+		"  alias TEXT PRIMARY KEY, filename TEXT, url TEXT,"
+		"  size TEXT, quant TEXT, downloaded INTEGER DEFAULT 0,"
+		"  active INTEGER DEFAULT 0, source TEXT DEFAULT 'registry',"
+		"  display_name TEXT);"
+		"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);"
+		"CREATE TABLE sessions ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  name TEXT DEFAULT 'New session',"
+		"  mode TEXT NOT NULL DEFAULT 'chat',"
+		"  model TEXT, cwd TEXT,"
+		"  created_at TEXT DEFAULT (datetime('now')),"
+		"  updated_at TEXT DEFAULT (datetime('now')));"
+		"CREATE TABLE messages ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+		"  seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,"
+		"  model TEXT, llm_use INTEGER DEFAULT 1,"
+		"  created_at TEXT DEFAULT (datetime('now')));"
+		"PRAGMA user_version = 0;";
+	ASSERT(sqlite3_exec(raw, legacy, NULL, NULL, NULL) == SQLITE_OK);
+	sqlite3_close(raw);
+	free(path);
+
+	EXPECT_EQ(db_open(), 0);
+
+	int v = -1;
+	sqlite3_stmt *st;
+	ASSERT(sqlite3_prepare_v2(db_handle(), "PRAGMA user_version;",
+	                          -1, &st, NULL) == SQLITE_OK);
+	if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
+	sqlite3_finalize(st);
+	EXPECT(v >= 2);   /* runner reached HEAD despite duplicate-column on v0->v1 */
+
+	db_close();
+	TEST_END();
+}
+
 static void test_settings_upsert(void)
 {
 	TEST_BEGIN("db_setting_set upserts; db_setting_get reads latest");
@@ -135,6 +346,11 @@ int main(void)
 	test_open_close_idempotent();
 	test_session_roundtrip_preserves_messages();
 	test_session_delete_cascades_to_messages();
+	test_message_status_default_and_set();
+	test_messages_load_for_context_filters_failed();
+	test_message_status_survives_reopen();
+	test_migrations_upgrade_legacy_db();
+	test_migrations_tolerate_already_applied_alters();
 	test_settings_upsert();
 
 	teardown_tmp_home();

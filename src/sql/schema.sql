@@ -36,5 +36,6 @@ CREATE TABLE IF NOT EXISTS messages (
     content     TEXT NOT NULL,
     model       TEXT,                -- alias of the model in effect for this turn
     llm_use     INTEGER DEFAULT 1,   -- include in prompt when building context
+    status      TEXT DEFAULT 'ok',   -- 'ok' or 'failed' (e.g. daemon down)
     created_at  TEXT DEFAULT (datetime('now'))
 );

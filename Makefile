@@ -147,15 +147,33 @@ tests/test_prompt: tests/test_prompt.o src/core/prompt.o
 tests/test_markdown: tests/test_markdown.o src/ui/markdown.o $(MD4C_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS) $(PLATFORM_LIBS)
 
-tests/%.o: tests/%.c
+tests/%.o: tests/%.c tests/test.h
 	$(CC) $(TEST_CFLAGS) -c $< -o $@
 
 test: $(TEST_BINS)
-	@fail=0; for t in $(TEST_BINS); do \
-		echo "---- $$t ----"; \
-		if ! ./$$t; then fail=1; fi; \
+	@fail=0; total_checks=0; total_groups=0; \
+	for t in $(TEST_BINS); do \
+		name=$$(basename $$t); \
+		out=$$(./$$t 2>&1); rc=$$?; \
+		summary=$$(printf '%s\n' "$$out" | tail -n 1); \
+		if [ $$rc -eq 0 ]; then \
+			printf "  %-22s %s\n" "$$name" "$$summary"; \
+			c=$$(printf '%s' "$$summary" | awk '{print $$1}'); \
+			g=$$(printf '%s' "$$summary" | awk '{print $$4}'); \
+			total_checks=$$((total_checks + c)); \
+			total_groups=$$((total_groups + g)); \
+		else \
+			printf "  %-22s FAIL\n" "$$name"; \
+			printf '%s\n' "$$out" | sed 's/^/    /'; \
+			fail=1; \
+		fi; \
 	done; \
-	if [ $$fail -ne 0 ]; then echo "TESTS FAILED"; exit 1; else echo "all tests passed"; fi
+	if [ $$fail -ne 0 ]; then \
+		echo ""; echo "TESTS FAILED"; exit 1; \
+	else \
+		echo ""; \
+		echo "  all tests passed ($$total_checks checks across $$total_groups tests in $(words $(TEST_BINS)) binaries)"; \
+	fi
 
 install: $(BIN) $(LLAMA_SERVER)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin

@@ -118,6 +118,10 @@ static void chunk_to_tui(const char *text, int len, void *user_data)
 
 static volatile int generating = 0;
 static char *gen_response = NULL;
+/* set by gen_thread_fn when dispatch fails (e.g. daemon down). main loop
+   reads this to roll back the trailing user message from the in-memory
+   session so the next request stays well-formed. -1 = no failure pending. */
+static volatile int gen_failed_user_seq = -1;
 
 struct gen_args {
 	char *base_url;
@@ -153,7 +157,16 @@ static void *gen_thread_fn(void *arg)
 		free(response);
 		const char *err = "[error: chat request failed. is 'kora serve' running?]";
 		tui_assistant_chunk(err, (int)strlen(err));
-		response = strdup(err);
+		response = NULL;   /* don't persist an error as an assistant turn */
+
+		/* roll back the user message we already wrote in the main loop:
+		   mark it 'failed' in the DB so it's not replayed in future
+		   context, and signal the main thread to drop it from the
+		   in-memory session (so the next request stays well-formed). */
+		if (ga->save_session_id >= 0)
+			db_message_set_status(ga->save_session_id,
+			                      ga->save_seq - 1, "failed");
+		gen_failed_user_seq = ga->save_seq - 1;
 	}
 
 	tui_assistant_end();
@@ -865,6 +878,24 @@ int main(int argc, char *argv[])
 					launch_naming(base_url, current_model, session, session->db_id);
 			}
 
+			if (!generating && gen_failed_user_seq >= 0) {
+				/* dispatch failed: drop the trailing user message from
+				   the in-memory session so the next request doesn't
+				   replay an unanswered turn. the DB row stays around
+				   tagged 'failed' for audit / future retry UI. */
+				if (session->n_msg > 0 &&
+				    strcmp(session->roles[session->n_msg - 1], "user") == 0) {
+					free(session->roles[session->n_msg - 1]);
+					free(session->contents[session->n_msg - 1]);
+					session->n_msg--;
+					if (session->user_msg_count > 0)
+						session->user_msg_count--;
+					update_context_status(session, cfg->ctx_size);
+				}
+				gen_failed_user_seq = -1;
+				tui_log("Message not delivered (daemon unreachable). Retype to retry.");
+			}
+
 			if (!compacting && compact_summary) {
 				kora_session_clear(session);
 				kora_session_add(session, "assistant", compact_summary);
@@ -1057,7 +1088,7 @@ int main(int argc, char *argv[])
 					} else {
 						kora_session_clear(session);
 						struct db_message *msgs = NULL;
-						int nm = db_messages_load(sid, &msgs);
+						int nm = db_messages_load_for_context(sid, &msgs);
 						session->msg_seq = 0;
 						session->user_msg_count = 0;
 						for (int i = 0; i < nm; i++) {
@@ -1273,7 +1304,7 @@ int main(int argc, char *argv[])
 							kora_session_clear(session);
 
 							struct db_message *msgs = NULL;
-							int nm = db_messages_load(sid, &msgs);
+							int nm = db_messages_load_for_context(sid, &msgs);
 
 							session->msg_seq = 0;
 							session->user_msg_count = 0;
@@ -1397,7 +1428,7 @@ int main(int argc, char *argv[])
 							/* reuse /resume N code path */
 							kora_session_clear(session);
 							struct db_message *msgs = NULL;
-							int nm = db_messages_load(sid, &msgs);
+							int nm = db_messages_load_for_context(sid, &msgs);
 							session->msg_seq = 0;
 							session->user_msg_count = 0;
 							for (int i = 0; i < nm; i++) {

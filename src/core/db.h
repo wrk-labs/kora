@@ -83,6 +83,11 @@ int db_session_get(int session_id, struct db_session *out);
 void db_message_add(int session_id, int seq, const char *role,
                     const char *content, const char *model, int llm_use);
 
+/* update the status of an existing message ('ok' or 'failed'). used to
+   roll back a user message when the daemon dispatch fails so the row
+   isn't replayed in future context. */
+void db_message_set_status(int session_id, int seq, const char *status);
+
 /* message info returned by load */
 struct db_message {
 	int seq;
@@ -90,11 +95,17 @@ struct db_message {
 	char *content;
 	char *model;   /* may be NULL */
 	int llm_use;
+	char *status;  /* 'ok' or 'failed' */
 };
 
 /* load all messages for a session. returns count, allocates *out.
    caller must free each role/content and the array itself. */
 int db_messages_load(int session_id, struct db_message **out);
+
+/* same as db_messages_load but excludes rows where status != 'ok'.
+   use this when rehydrating an in-memory session for context, so failed
+   user turns (daemon dispatch failures) aren't replayed to the model. */
+int db_messages_load_for_context(int session_id, struct db_message **out);
 
 /* free an array of messages returned by db_messages_load */
 void db_messages_free(struct db_message *msgs, int count);
