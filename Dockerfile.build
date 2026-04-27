@@ -1,0 +1,25 @@
+# Build environment for the kora .deb. Mirrors what release.yml installs in
+# CI; useful for local builds:
+#
+#   docker build -f Dockerfile.build -t kora-build .
+#   docker run --rm -v "$PWD:/src" -w /src kora-build make deb DEB_VERSION=0.1.0
+
+FROM debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+        pkg-config \
+        libcurl4-openssl-dev \
+        libsqlite3-dev \
+        libncurses-dev \
+        xxd \
+        dpkg-dev \
+        fakeroot \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

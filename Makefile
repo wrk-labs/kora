@@ -189,4 +189,27 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/llama-server
 	rm -rf $(DESTDIR)$(LUADIR)
 
-.PHONY: all clean clean-all install uninstall test
+# --- debian package ---
+# `make deb` produces dist/kora_<version>_<arch>.deb. CI overrides DEB_VERSION
+# from the git tag (refs/tags/vX.Y.Z -> X.Y.Z); local builds default to the
+# Makefile VERSION.
+DEB_VERSION ?= $(VERSION)
+DEB_ARCH    := $(shell dpkg --print-architecture 2>/dev/null)
+DEB_STAGE   := dist/deb-stage
+DEB_FILE    := dist/kora_$(DEB_VERSION)_$(DEB_ARCH).deb
+
+deb: debian/control.in
+	$(MAKE) clean-all
+	$(MAKE) PREFIX=/usr LUADIR=/usr/share/kora/lua
+	rm -rf $(DEB_STAGE)
+	$(MAKE) install DESTDIR=$(DEB_STAGE) PREFIX=/usr LUADIR=/usr/share/kora/lua
+	mkdir -p $(DEB_STAGE)/DEBIAN
+	sed -e 's|__VERSION__|$(DEB_VERSION)|g' \
+	    -e 's|__ARCH__|$(DEB_ARCH)|g' \
+	    debian/control.in > $(DEB_STAGE)/DEBIAN/control
+	mkdir -p dist
+	fakeroot dpkg-deb --build --root-owner-group $(DEB_STAGE) $(DEB_FILE)
+	@echo
+	@echo "  built $(DEB_FILE)"
+
+.PHONY: all clean clean-all install uninstall test deb

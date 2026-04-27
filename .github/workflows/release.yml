@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: build .deb (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: debian:trixie-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest        # x86_64 native
+          - arch: arm64
+            runner: ubuntu-24.04-arm     # arm64 native (GitHub-hosted)
+    steps:
+      - name: install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config \
+            libcurl4-openssl-dev libsqlite3-dev libncurses-dev \
+            xxd dpkg-dev fakeroot ca-certificates
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: build .deb
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          make deb DEB_VERSION="$VERSION"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          retention-days: 1
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: download all .debs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true

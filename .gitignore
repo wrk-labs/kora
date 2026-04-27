@@ -9,3 +9,4 @@ vendor/llama.cpp/build/
 tests/test_*
 !tests/test_*.c
 !tests/test.h
+dist/
