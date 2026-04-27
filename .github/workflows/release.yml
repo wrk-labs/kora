@@ -33,10 +33,18 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: build .deb
+      - name: verify tag matches VERSION
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          make deb DEB_VERSION="$VERSION"
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          FILE_VER=$(cat VERSION)
+          if [ "$TAG_VER" != "$FILE_VER" ]; then
+            echo "ERROR: tag $TAG_VER does not match VERSION file $FILE_VER"
+            exit 1
+          fi
+          echo "tag and VERSION match: $TAG_VER"
+
+      - name: build .deb
+        run: make deb
 
       - name: upload artifact
         uses: actions/upload-artifact@v4

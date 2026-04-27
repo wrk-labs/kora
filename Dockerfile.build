@@ -2,7 +2,9 @@
 # CI; useful for local builds:
 #
 #   docker build -f Dockerfile.build -t kora-build .
-#   docker run --rm -v "$PWD:/src" -w /src kora-build make deb DEB_VERSION=0.1.0
+#   docker run --rm -v "$PWD:/src" -w /src kora-build make deb
+#
+# Version is read from debian/changelog automatically.
 
 FROM debian:trixie-slim
 

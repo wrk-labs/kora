@@ -1,6 +1,8 @@
 include config.mk
 
-VERSION = 0.1.0
+# Version lives in the VERSION file (single source of truth).
+# To release: bump VERSION, commit, tag the same value with `v` prefix, push tag.
+VERSION := $(shell cat VERSION)
 UNAME_S := $(shell uname -s)
 
 SRC_C = src/core/main.c src/core/util.c src/core/db.c src/core/dispatch.c \
