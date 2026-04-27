@@ -4,11 +4,10 @@ Section: utils
 Priority: optional
 Architecture: __ARCH__
 Maintainer: willgcr <hello@willgcr.me>
-Depends: libc6, libstdc++6, libcurl4t64 | libcurl4, libsqlite3-0, libncursesw6
+Depends: libc6, libstdc++6, libcurl4t64 | libcurl4, libsqlite3-0, libncursesw6, libgomp1
 Homepage: https://wrklabs.org/kora
 Description: terminal-based local LLM chat client
  Kora is a terminal-based chat client for local LLMs, built on llama.cpp.
- .
  Includes a three-pane TUI, a multi-model supervisor with an
  OpenAI-compatible HTTP API, SQLite-backed session persistence, and
  markdown rendering.
