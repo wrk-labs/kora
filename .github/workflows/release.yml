@@ -9,7 +9,9 @@ jobs:
   build:
     name: build .deb (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    container: debian:trixie-slim
+    container: debian:bullseye-slim   # build against oldest still-supported glibc
+                                      # so binaries run on bullseye, bookworm,
+                                      # trixie, ubuntu 22.04+, etc.
     strategy:
       fail-fast: false
       matrix:

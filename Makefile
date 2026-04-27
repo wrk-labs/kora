@@ -72,6 +72,12 @@ src/core/db.o: $(SCHEMA_HDR)
 # --- vendor libs ---
 # kora links against liblua (for config) but NOT libllama. llama-server is
 # a separate binary that the supervisor execs.
+#
+# LLAMA_NATIVE controls whether llama.cpp uses -march=native (CPU-specific
+# optimizations). Default OFF for portable distribution builds — set ON for
+# local dev to squeeze out perf on your own machine.
+LLAMA_NATIVE ?= OFF
+
 $(LLAMA_SERVER):
 	cmake -S vendor/llama.cpp -B $(LLAMA_BUILD) \
 		-DCMAKE_BUILD_TYPE=Release \
@@ -81,6 +87,7 @@ $(LLAMA_SERVER):
 		-DLLAMA_BUILD_TOOLS=ON \
 		-DLLAMA_BUILD_SERVER=ON \
 		-DBUILD_SHARED_LIBS=OFF \
+		-DGGML_NATIVE=$(LLAMA_NATIVE) \
 		$(LLAMA_CMAKE_FLAGS)
 	cmake --build $(LLAMA_BUILD) --config Release -j$(NPROC) --target llama-server
 

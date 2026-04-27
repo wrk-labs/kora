@@ -6,7 +6,10 @@
 #
 # Version is read from the VERSION file at the repo root.
 
-FROM debian:trixie-slim
+FROM debian:bullseye-slim
+# build against oldest still-supported glibc so the resulting .deb runs on
+# bullseye, bookworm, trixie, and ubuntu 22.04+. switch to bookworm when
+# bullseye hits EOL (~aug 2026).
 
 ENV DEBIAN_FRONTEND=noninteractive
 
