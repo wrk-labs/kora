@@ -52,7 +52,10 @@ ifeq ($(UNAME_S),Darwin)
 else
   NPROC := $(shell nproc)
   LUA_PLATFORM = linux
-  PLATFORM_LIBS = -lm -lpthread -lstdc++ -lncursesw -lsqlite3
+  # -ldl is required for lua's loadlib (dlsym) on glibc < 2.34, where libdl
+  # is still its own DSO. on glibc 2.34+ libdl was merged into libc and -ldl
+  # is a harmless no-op alias for -lc.
+  PLATFORM_LIBS = -lm -lpthread -lstdc++ -lncursesw -lsqlite3 -ldl
 endif
 
 # default target
