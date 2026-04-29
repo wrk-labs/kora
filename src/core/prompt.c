@@ -102,7 +102,7 @@ char *kora_prompt_render(const char *tmpl, const char *model, int ctx_size)
 
 	char date_buf[64]     = {0};
 	char time_buf[32]     = {0};
-	char platform_buf[32] = {0};
+	char platform_buf[68] = {0};
 	char ctx_buf[32]      = {0};
 	const char *model_str = (model && *model) ? model : "(unknown)";
 

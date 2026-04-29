@@ -97,11 +97,18 @@ static void derive_synth_display(const char *alias, char *out, size_t out_sz)
 {
 	const char *slash = strrchr(alias, '/');
 	const char *base  = slash ? slash + 1 : alias;
-	snprintf(out, out_sz, "%s", base);
+	size_t blen = strlen(base);
+	if (blen >= out_sz) blen = out_sz - 1;
+	memcpy(out, base, blen);
+	out[blen] = '\0';
 	char *q = strchr(out, '?');
 	if (q) *q = '\0';
-	if (out[0] == '\0')
-		snprintf(out, out_sz, "%s", alias);
+	if (out[0] == '\0') {
+		blen = strlen(alias);
+		if (blen >= out_sz) blen = out_sz - 1;
+		memcpy(out, alias, blen);
+		out[blen] = '\0';
+	}
 }
 
 static void refresh_synth_row(void)

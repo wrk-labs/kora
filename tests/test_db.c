@@ -28,7 +28,7 @@ static void teardown_tmp_home(void)
 	/* best-effort cleanup; tests are sandboxed under /tmp anyway. */
 	char cmd[600];
 	snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmp_home);
-	(void)system(cmd);
+	if (system(cmd) != 0) { /* best-effort */ }
 }
 
 static void test_open_close_idempotent(void)
@@ -105,83 +105,33 @@ static void test_session_delete_cascades_to_messages(void)
 	TEST_END();
 }
 
-static void test_message_status_default_and_set(void)
+static void test_message_delete_removes_row(void)
 {
-	TEST_BEGIN("messages default to status 'ok'; db_message_set_status flips to 'failed'");
-	ASSERT(db_open() == 0);
-
-	int sid = db_session_create("chat", "m", NULL);
-	EXPECT(sid > 0);
-	db_message_add(sid, 0, "user", "hi", "m", 1);
-
-	struct db_message *msgs = NULL;
-	int n = db_messages_load(sid, &msgs);
-	EXPECT_EQ(n, 1);
-	ASSERT(msgs != NULL);
-	EXPECT_STREQ(msgs[0].status, "ok");
-	db_messages_free(msgs, n);
-
-	db_message_set_status(sid, 0, "failed");
-
-	msgs = NULL;
-	n = db_messages_load(sid, &msgs);
-	EXPECT_EQ(n, 1);
-	ASSERT(msgs != NULL);
-	EXPECT_STREQ(msgs[0].status, "failed");
-	db_messages_free(msgs, n);
-
-	db_close();
-	TEST_END();
-}
-
-static void test_messages_load_for_context_filters_failed(void)
-{
-	TEST_BEGIN("db_messages_load_for_context excludes failed rows");
+	TEST_BEGIN("db_message_delete removes a message by session + seq");
 	ASSERT(db_open() == 0);
 
 	int sid = db_session_create("chat", "m", NULL);
 	db_message_add(sid, 0, "user",      "good question",   "m", 1);
 	db_message_add(sid, 1, "assistant", "good answer",     "m", 1);
 	db_message_add(sid, 2, "user",      "dispatch failed", "m", 1);
-	db_message_set_status(sid, 2, "failed");
 	db_message_add(sid, 3, "user",      "later turn",      "m", 1);
 
-	struct db_message *all = NULL;
-	int n_all = db_messages_load(sid, &all);
-	EXPECT_EQ(n_all, 4);   /* full loader still returns everything */
-	db_messages_free(all, n_all);
-
-	struct db_message *ctx = NULL;
-	int n_ctx = db_messages_load_for_context(sid, &ctx);
-	EXPECT_EQ(n_ctx, 3);   /* failed row is filtered */
-	ASSERT(ctx != NULL);
-	EXPECT_STREQ(ctx[0].content, "good question");
-	EXPECT_STREQ(ctx[1].content, "good answer");
-	EXPECT_STREQ(ctx[2].content, "later turn");
-	db_messages_free(ctx, n_ctx);
-
-	db_close();
-	TEST_END();
-}
-
-static void test_message_status_survives_reopen(void)
-{
-	TEST_BEGIN("message status round-trips through close+reopen");
-	ASSERT(db_open() == 0);
-	int sid = db_session_create("chat", "m", NULL);
-	db_message_add(sid, 0, "user",      "lost message", "m", 1);
-	db_message_add(sid, 1, "assistant", "ok",           "m", 1);
-	db_message_set_status(sid, 0, "failed");
-	db_close();
-
-	ASSERT(db_open() == 0);
 	struct db_message *msgs = NULL;
 	int n = db_messages_load(sid, &msgs);
-	EXPECT_EQ(n, 2);
-	ASSERT(msgs != NULL);
-	EXPECT_STREQ(msgs[0].status, "failed");
-	EXPECT_STREQ(msgs[1].status, "ok");
+	EXPECT_EQ(n, 4);
 	db_messages_free(msgs, n);
+
+	db_message_delete(sid, 2);
+
+	msgs = NULL;
+	n = db_messages_load(sid, &msgs);
+	EXPECT_EQ(n, 3);
+	ASSERT(msgs != NULL);
+	EXPECT_STREQ(msgs[0].content, "good question");
+	EXPECT_STREQ(msgs[1].content, "good answer");
+	EXPECT_STREQ(msgs[2].content, "later turn");
+	db_messages_free(msgs, n);
+
 	db_close();
 	TEST_END();
 }
@@ -240,15 +190,14 @@ static void test_migrations_upgrade_legacy_db(void)
 	                          -1, &st, NULL) == SQLITE_OK);
 	if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int(st, 0);
 	sqlite3_finalize(st);
-	EXPECT(v >= 2);   /* at least v2 (status column) */
+	EXPECT(v >= 4);   /* at least v4 (model column on messages) */
 
-	/* the pre-existing user message should still be there with default status. */
+	/* the pre-existing user message should still be there. */
 	struct db_message *msgs = NULL;
 	int n = db_messages_load(1, &msgs);
 	EXPECT_EQ(n, 1);
 	ASSERT(msgs != NULL);
 	EXPECT_STREQ(msgs[0].content, "pre-migration");
-	EXPECT_STREQ(msgs[0].status,  "ok");
 	db_messages_free(msgs, n);
 
 	/* second open is a no-op: already at HEAD, no migration runs. */
@@ -346,9 +295,7 @@ int main(void)
 	test_open_close_idempotent();
 	test_session_roundtrip_preserves_messages();
 	test_session_delete_cascades_to_messages();
-	test_message_status_default_and_set();
-	test_messages_load_for_context_filters_failed();
-	test_message_status_survives_reopen();
+	test_message_delete_removes_row();
 	test_migrations_upgrade_legacy_db();
 	test_migrations_tolerate_already_applied_alters();
 	test_settings_upsert();

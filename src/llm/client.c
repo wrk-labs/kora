@@ -215,8 +215,8 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
 
 	for (size_t i = 0; i < total; i++) {
 		if (ptr[i] == '\n') {
-			on_sse_line(ctx, ctx->pending.buf ? ctx->pending.buf : "",
-			            ctx->pending.len);
+			if (ctx->pending.buf)
+				on_sse_line(ctx, ctx->pending.buf, ctx->pending.len);
 			ctx->pending.len = 0;
 			if (ctx->pending.buf) ctx->pending.buf[0] = '\0';
 		} else if (ptr[i] != '\r') {

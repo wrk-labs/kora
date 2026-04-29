@@ -27,7 +27,7 @@ static void teardown_tmp_home(void)
 {
 	char cmd[600];
 	snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmp_home);
-	(void)system(cmd);
+	if (system(cmd) != 0) { /* best-effort */ }
 }
 
 static void write_user_config(const char *body)

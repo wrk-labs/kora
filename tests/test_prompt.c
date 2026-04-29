@@ -105,7 +105,7 @@ static void test_date_looks_sane(void)
 	time_t now = time(NULL);
 	struct tm tm;
 	localtime_r(&now, &tm);
-	char year[8];
+	char year[16];
 	snprintf(year, sizeof year, "%d", tm.tm_year + 1900);
 	EXPECT(strstr(out, year) != NULL);
 	free(out);
