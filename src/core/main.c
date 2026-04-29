@@ -160,12 +160,12 @@ static void *gen_thread_fn(void *arg)
 		response = NULL;   /* don't persist an error as an assistant turn */
 
 		/* roll back the user message we already wrote in the main loop:
-		   mark it 'failed' in the DB so it's not replayed in future
-		   context, and signal the main thread to drop it from the
-		   in-memory session (so the next request stays well-formed). */
+		   delete it from the DB so it's not replayed in future context,
+		   and signal the main thread to drop it from the in-memory
+		   session (so the next request stays well-formed). */
 		if (ga->save_session_id >= 0)
-			db_message_set_status(ga->save_session_id,
-			                      ga->save_seq - 1, "failed");
+			db_message_delete(ga->save_session_id,
+			                  ga->save_seq - 1);
 		gen_failed_user_seq = ga->save_seq - 1;
 	}
 
@@ -881,8 +881,8 @@ int main(int argc, char *argv[])
 			if (!generating && gen_failed_user_seq >= 0) {
 				/* dispatch failed: drop the trailing user message from
 				   the in-memory session so the next request doesn't
-				   replay an unanswered turn. the DB row stays around
-				   tagged 'failed' for audit / future retry UI. */
+				   replay an unanswered turn (the DB row was already
+				   deleted in gen_thread_fn). */
 				if (session->n_msg > 0 &&
 				    strcmp(session->roles[session->n_msg - 1], "user") == 0) {
 					free(session->roles[session->n_msg - 1]);
@@ -1088,7 +1088,7 @@ int main(int argc, char *argv[])
 					} else {
 						kora_session_clear(session);
 						struct db_message *msgs = NULL;
-						int nm = db_messages_load_for_context(sid, &msgs);
+						int nm = db_messages_load(sid, &msgs);
 						session->msg_seq = 0;
 						session->user_msg_count = 0;
 						for (int i = 0; i < nm; i++) {
@@ -1304,7 +1304,7 @@ int main(int argc, char *argv[])
 							kora_session_clear(session);
 
 							struct db_message *msgs = NULL;
-							int nm = db_messages_load_for_context(sid, &msgs);
+							int nm = db_messages_load(sid, &msgs);
 
 							session->msg_seq = 0;
 							session->user_msg_count = 0;
@@ -1428,7 +1428,7 @@ int main(int argc, char *argv[])
 							/* reuse /resume N code path */
 							kora_session_clear(session);
 							struct db_message *msgs = NULL;
-							int nm = db_messages_load_for_context(sid, &msgs);
+							int nm = db_messages_load(sid, &msgs);
 							session->msg_seq = 0;
 							session->user_msg_count = 0;
 							for (int i = 0; i < nm; i++) {

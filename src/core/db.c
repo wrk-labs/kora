@@ -45,10 +45,15 @@ static void db_lock_init(void)
 static const char *migrations[] = {
 	/* v0 -> v1: pre-registry models gain a display_name column. */
 	"ALTER TABLE models ADD COLUMN display_name TEXT;",
-	/* v1 -> v2: messages get a status column so we can mark turns
-	   that failed mid-dispatch (e.g. daemon down) and skip them in
-	   future context loads. */
+	/* v1 -> v2: (legacy) added status column; kept for upgrade path. */
 	"ALTER TABLE messages ADD COLUMN status TEXT DEFAULT 'ok';",
+	/* v2 -> v3: delete failed messages instead of keeping them tagged.
+	   the column stays (SQLite < 3.35 can't DROP COLUMN) but is unused. */
+	"DELETE FROM messages WHERE status = 'failed';",
+	/* v3 -> v4: messages.model was added to schema.sql but never migrated.
+	   existing DBs created before the column was introduced are missing it,
+	   which causes db_message_add INSERTs to silently fail. */
+	"ALTER TABLE messages ADD COLUMN model TEXT;",
 };
 #define MIGRATIONS_HEAD ((int)(sizeof migrations / sizeof migrations[0]))
 
@@ -704,23 +709,22 @@ out:
 	DB_UNLOCK();
 }
 
-void db_message_set_status(int session_id, int seq, const char *status)
+void db_message_delete(int session_id, int seq)
 {
 	sqlite3_stmt *stmt;
 
 	DB_LOCK();
-	if (!db || !status) goto out;
+	if (!db) goto out;
 
 	const char *sql =
-		"UPDATE messages SET status = ? "
+		"DELETE FROM messages "
 		"WHERE session_id = ? AND seq = ?;";
 
 	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
 		goto out;
 
-	sqlite3_bind_text(stmt, 1, status, -1, SQLITE_STATIC);
-	sqlite3_bind_int (stmt, 2, session_id);
-	sqlite3_bind_int (stmt, 3, seq);
+	sqlite3_bind_int(stmt, 1, session_id);
+	sqlite3_bind_int(stmt, 2, seq);
 	sqlite3_step(stmt);
 	sqlite3_finalize(stmt);
 
@@ -728,14 +732,12 @@ out:
 	DB_UNLOCK();
 }
 
-static int db_messages_load_where(int session_id, const char *extra_where,
-                                   struct db_message **out)
+int db_messages_load(int session_id, struct db_message **out)
 {
 	sqlite3_stmt *stmt;
 	int count = 0;
 	int cap = 64;
 	struct db_message *msgs;
-	char sql[256];
 
 	DB_LOCK();
 
@@ -744,10 +746,9 @@ static int db_messages_load_where(int session_id, const char *extra_where,
 	msgs = malloc(cap * sizeof(*msgs));
 	if (!msgs) { *out = NULL; goto done; }
 
-	snprintf(sql, sizeof sql,
-		"SELECT seq, role, content, model, llm_use, status FROM messages "
-		"WHERE session_id = ? %s ORDER BY seq ASC;",
-		extra_where ? extra_where : "");
+	const char *sql =
+		"SELECT seq, role, content, model, llm_use FROM messages "
+		"WHERE session_id = ? ORDER BY seq ASC;";
 
 	if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
 		free(msgs);
@@ -768,12 +769,10 @@ static int db_messages_load_where(int session_id, const char *extra_where,
 		const char *r = (const char *)sqlite3_column_text(stmt, 1);
 		const char *c = (const char *)sqlite3_column_text(stmt, 2);
 		const char *m = (const char *)sqlite3_column_text(stmt, 3);
-		const char *s = (const char *)sqlite3_column_text(stmt, 5);
 		msgs[count].role = r ? strdup(r) : strdup("");
 		msgs[count].content = c ? strdup(c) : strdup("");
 		msgs[count].model = m ? strdup(m) : NULL;
 		msgs[count].llm_use = sqlite3_column_int(stmt, 4);
-		msgs[count].status = strdup(s ? s : "ok");
 		count++;
 	}
 	sqlite3_finalize(stmt);
@@ -784,19 +783,6 @@ done:
 	return count;
 }
 
-int db_messages_load(int session_id, struct db_message **out)
-{
-	return db_messages_load_where(session_id, NULL, out);
-}
-
-int db_messages_load_for_context(int session_id, struct db_message **out)
-{
-	/* exclude rows that didn't complete a full turn (e.g. user msg whose
-	   dispatch failed). NULL status from old rows is treated as 'ok'. */
-	return db_messages_load_where(session_id,
-		"AND (status IS NULL OR status = 'ok')", out);
-}
-
 void db_messages_free(struct db_message *msgs, int count)
 {
 	int i;
@@ -805,7 +791,6 @@ void db_messages_free(struct db_message *msgs, int count)
 		free(msgs[i].role);
 		free(msgs[i].content);
 		free(msgs[i].model);
-		free(msgs[i].status);
 	}
 	free(msgs);
 }
