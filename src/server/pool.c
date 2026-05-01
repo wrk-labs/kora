@@ -13,6 +13,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+
 #include "internal.h"
 #include "model.h"
 #include "util.h"
@@ -126,11 +130,16 @@ static const char *llama_server_path(void)
 {
 	static char cached[280];
 	if (cached[0]) return cached;
-#ifdef __linux__
-	char exe[256];
-	ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+	char exe[256] = {0};
+	ssize_t n = -1;
+#if defined(__linux__)
+	n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+	if (n > 0) exe[n] = '\0';
+#elif defined(__APPLE__)
+	uint32_t sz = sizeof exe;
+	if (_NSGetExecutablePath(exe, &sz) == 0) n = (ssize_t)strlen(exe);
+#endif
 	if (n > 0) {
-		exe[n] = '\0';
 		char *slash = strrchr(exe, '/');
 		if (slash) {
 			*slash = '\0';
@@ -138,7 +147,7 @@ static const char *llama_server_path(void)
 			if (access(cached, X_OK) == 0) return cached;
 		}
 	}
-#endif
+	/* fall back to PATH lookup if introspection failed */
 	snprintf(cached, sizeof cached, "llama-server");
 	return cached;
 }
@@ -265,12 +274,15 @@ int kora_pool_ensure_ready(const char *requested, int *out_slot)
 		snprintf(port_s, sizeof port_s, "%d", port);
 		snprintf(ctx_s,  sizeof ctx_s,  "%d", ctx);
 		snprintf(par_s,  sizeof par_s,  "%d", parallel);
-		execl(llama_server_path(), "llama-server",
-		      "-m", gguf, "--host", "127.0.0.1",
-		      "--port", port_s, "--ctx-size", ctx_s,
-		      "--parallel", par_s,
-		      "--log-disable",
-		      (char *)NULL);
+		/* execlp searches PATH only if the argument has no slash —
+		 * an absolute path from llama_server_path() is used as-is, while
+		 * the bare "llama-server" fallback gets a real PATH lookup. */
+		execlp(llama_server_path(), "llama-server",
+		       "-m", gguf, "--host", "127.0.0.1",
+		       "--port", port_s, "--ctx-size", ctx_s,
+		       "--parallel", par_s,
+		       "--log-disable",
+		       (char *)NULL);
 		_exit(127);
 	}
 	free(gguf);
