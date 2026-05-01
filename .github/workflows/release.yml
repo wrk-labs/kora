@@ -6,12 +6,29 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  verify:
+    name: verify tag matches VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: check
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          FILE_VER=$(cat VERSION)
+          if [ "$TAG_VER" != "$FILE_VER" ]; then
+            echo "ERROR: tag $TAG_VER does not match VERSION file $FILE_VER"
+            exit 1
+          fi
+          echo "tag and VERSION match: $TAG_VER"
+
+  linux-build:
     name: build .deb (${{ matrix.arch }})
+    needs: verify
     runs-on: ${{ matrix.runner }}
-    container: debian:bullseye-slim   # build against oldest still-supported glibc
-                                      # so binaries run on bullseye, bookworm,
-                                      # trixie, ubuntu 22.04+, etc.
+    container: debian:bullseye-slim   # oldest still-supported glibc → runs on
+                                      # bullseye/bookworm/trixie/Ubuntu 22.04+
     strategy:
       fail-fast: false
       matrix:
@@ -35,16 +52,6 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: verify tag matches VERSION
-        run: |
-          TAG_VER="${GITHUB_REF_NAME#v}"
-          FILE_VER=$(cat VERSION)
-          if [ "$TAG_VER" != "$FILE_VER" ]; then
-            echo "ERROR: tag $TAG_VER does not match VERSION file $FILE_VER"
-            exit 1
-          fi
-          echo "tag and VERSION match: $TAG_VER"
-
       - name: build .deb
         run: make deb
 
@@ -55,22 +62,72 @@ jobs:
           path: dist/*.deb
           retention-days: 1
 
+  macos-build:
+    name: build darwin tarball (${{ matrix.arch }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14            # Apple Silicon only; Intel runners deprecated
+    steps:
+      - name: install build deps
+        # kora's Makefile prefers Homebrew ncurses on Darwin (mouse v2 +
+        # wide-char). cmake, sqlite3, libcurl, xxd are pre-installed on
+        # macos-14 runners.
+        run: brew install ncurses
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: build
+        # LUADIR is baked into the binary at compile time; point it at the
+        # eventual Homebrew arm64 install location so kora can find lua/core
+        # at runtime via the standard /opt/homebrew prefix.
+        run: make LUADIR=/opt/homebrew/share/kora/lua
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+      - name: package tarball
+        # Flat tarball (binaries + lua/core/ + LICENSE at root). Brew's
+        # def install copies files into the prefix directly.
+        run: |
+          VER=$(cat VERSION)
+          ARCH=${{ matrix.arch }}
+          mkdir -p dist
+          tar -czf "dist/kora-${VER}-darwin-${ARCH}.tar.gz" \
+              kora llama-server lua/core LICENSE
+          ls -la dist/
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          retention-days: 1
+
   release:
     name: publish github release
-    needs: build
+    needs: [linux-build, macos-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: download all .debs
+      - name: download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: deb-*
           path: dist
           merge-multiple: true
 
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.deb
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
           generate_release_notes: true
