@@ -54,6 +54,9 @@ static long now_ns(void)
 }
 
 #if defined(__linux__)
+/* Forward decl — defined later; resolve_backends_dir needs it now. */
+static const char *llama_server_path(void);
+
 /* Resolve the backends directory: <real-dir-of-llama-server>/backends. Uses
  * realpath so the prod symlink (/usr/bin/llama-server -> /usr/lib/kora/...)
  * lands at /usr/lib/kora/backends, while the dev tree (./llama-server)
