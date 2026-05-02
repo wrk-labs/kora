@@ -24,11 +24,12 @@ jobs:
           echo "tag and VERSION match: $TAG_VER"
 
   linux-build:
-    name: build .deb (${{ matrix.arch }})
+    name: build kora .deb (${{ matrix.arch }})
     needs: verify
     runs-on: ${{ matrix.runner }}
-    container: debian:bullseye-slim   # oldest still-supported glibc → runs on
-                                      # bullseye/bookworm/trixie/Ubuntu 22.04+
+    container: debian:bookworm-slim   # bookworm packages glslc (needed for
+                                      # llama.cpp Vulkan backend); .deb runs
+                                      # on bookworm/trixie/Ubuntu 24.04+.
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +45,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential cmake git pkg-config \
             libcurl4-openssl-dev libsqlite3-dev libncurses-dev \
+            libvulkan-dev glslc patchelf \
             xxd dpkg-dev fakeroot ca-certificates
 
       - name: checkout
@@ -60,6 +62,40 @@ jobs:
         with:
           name: deb-${{ matrix.arch }}
           path: dist/*.deb
+          retention-days: 1
+
+  cuda-build:
+    name: build kora-cuda .deb (amd64)
+    needs: verify
+    runs-on: ubuntu-latest
+    # CUDA only matters on NVIDIA hardware, which is effectively amd64-only
+    # for kora's audience. nvcc compiles without a GPU present, so a plain
+    # ubuntu-latest runner with the CUDA toolkit container is enough.
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - name: install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config \
+            patchelf dpkg-dev fakeroot ca-certificates
+
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: build kora-cuda .deb
+        run: make cuda-deb
+        env:
+          CUDA_HOME: /usr/local/cuda
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-cuda-amd64
+          path: dist/kora-cuda_*.deb
           retention-days: 1
 
   macos-build:
@@ -113,7 +149,7 @@ jobs:
 
   release:
     name: publish github release
-    needs: [linux-build, macos-build]
+    needs: [linux-build, cuda-build, macos-build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

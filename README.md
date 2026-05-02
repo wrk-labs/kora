@@ -14,22 +14,57 @@ Kora runs large language models entirely on your machine — no cloud, no API ke
 - **Markdown rendering** — assistant replies are re-styled with bold / italic / inline code / headings / lists / blockquotes / fenced code blocks once the stream finishes (via vendored md4c)
 - **Non-blocking UI** — generation, compaction, and downloads all run on background threads; the pane stays responsive
 - **Scrollable chat** — mouse-wheel scroll in the chat pane
-- **GPU acceleration** — automatic VRAM detection and layer offloading via the vendored llama.cpp
+- **GPU acceleration** — auto-detected at runtime; Metal on macOS, Vulkan on Linux out of the box, optional CUDA addon for NVIDIA
 
 ## Install
+
+**macOS** (Homebrew, Apple Silicon):
+
+```
+brew tap wrk-labs/tap https://brew.wrklabs.org/tap.git
+brew install kora
+```
+
+The bottle ships with the Metal backend embedded — kora uses your Mac's
+GPU automatically, no flags or config.
+
+**Linux** (Debian/Ubuntu):
+
+```
+curl -fsSL https://apt.wrklabs.org/key.asc | sudo tee /etc/apt/keyrings/wrklabs.asc
+echo "deb [signed-by=/etc/apt/keyrings/wrklabs.asc] https://apt.wrklabs.org stable main" \
+  | sudo tee /etc/apt/sources.list.d/wrklabs.list
+sudo apt update
+sudo apt install kora
+```
+
+The base `kora` package ships the Vulkan backend, which works on
+NVIDIA / AMD / Intel GPUs as long as you have a Vulkan driver installed
+(`mesa-vulkan-drivers` for AMD/Intel, `nvidia-driver-libs-vulkan` for
+NVIDIA). With no GPU, kora falls back to CPU automatically.
+
+For maximum NVIDIA performance, install the optional CUDA addon:
+
+```
+sudo apt install kora-cuda
+```
+
+`kora-cuda` is a thin plugin — it just drops the CUDA backend
+(`libggml-cuda.so` + bundled cuBLAS) into kora's runtime backend
+directory. With it installed, kora picks CUDA over Vulkan on every
+model load. `apt remove kora-cuda` drops back to Vulkan/CPU without
+breaking kora.
+
+**From source** (any platform):
 
 ```
 make && sudo make install
 ```
 
-For GPU support, pass the backend flag:
-
-```
-make GGML_CUDA=1      # NVIDIA
-make GGML_VULKAN=1    # NVIDIA, AMD, Intel
-make GGML_HIP=1       # AMD (ROCm)
-make GGML_METAL=1     # Apple Silicon
-```
+The Makefile picks the right backend flags automatically: Metal on
+macOS, Vulkan + CPU plugins on Linux. CUDA is built separately via
+`make cuda-plugin` inside an `nvidia/cuda` container — see
+`Dockerfile.cuda-build`.
 
 ## Usage
 

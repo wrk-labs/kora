@@ -49,6 +49,10 @@ ifeq ($(UNAME_S),Darwin)
     NCURSES_LIB = -lncurses
   endif
   PLATFORM_LIBS = -lm -lpthread $(NCURSES_LIB) -lsqlite3
+  # Metal is the only realistic GPU on macOS. Compile it in and embed the
+  # shader library so the bottle is a single self-contained binary — no
+  # plugin .so files, no ggml-metal.metal sidecar, no GGML_BACKEND_PATH.
+  LLAMA_GPU_FLAGS = -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
 else
   NPROC := $(shell nproc)
   LUA_PLATFORM = linux
@@ -56,6 +60,11 @@ else
   # is still its own DSO. on glibc 2.34+ libdl was merged into libc and -ldl
   # is a harmless no-op alias for -lc.
   PLATFORM_LIBS = -lm -lpthread -lstdc++ -lncursesw -lsqlite3 -ldl
+  # Linux ships with dynamic backend loading: the kora .deb bundles the CPU
+  # and Vulkan backends as .so files under /usr/lib/kora/backends/; the
+  # optional kora-cuda .deb drops libggml-cuda.so into the same directory
+  # and llama-server picks the best backend at runtime.
+  LLAMA_GPU_FLAGS = -DGGML_BACKEND_DL=ON -DGGML_CPU=ON -DGGML_VULKAN=ON
 endif
 
 # default target
@@ -81,6 +90,17 @@ src/core/db.o: $(SCHEMA_HDR)
 # local dev to squeeze out perf on your own machine.
 LLAMA_NATIVE ?= OFF
 
+# macOS keeps llama.cpp statically linked (Metal compiles in, single binary).
+# Linux needs BUILD_SHARED_LIBS=ON because GGML_BACKEND_DL requires it (cmake
+# enforces this with a FATAL_ERROR otherwise) — the trade-off is that we ship
+# libllama.so / libggml.so / libggml-base.so alongside llama-server in the
+# .deb, plus the per-backend plugin .so files.
+ifeq ($(UNAME_S),Darwin)
+  LLAMA_SHARED = OFF
+else
+  LLAMA_SHARED = ON
+endif
+
 $(LLAMA_SERVER):
 	cmake -S vendor/llama.cpp -B $(LLAMA_BUILD) \
 		-DCMAKE_BUILD_TYPE=Release \
@@ -89,8 +109,9 @@ $(LLAMA_SERVER):
 		-DLLAMA_BUILD_COMMON=ON \
 		-DLLAMA_BUILD_TOOLS=ON \
 		-DLLAMA_BUILD_SERVER=ON \
-		-DBUILD_SHARED_LIBS=OFF \
+		-DBUILD_SHARED_LIBS=$(LLAMA_SHARED) \
 		-DGGML_NATIVE=$(LLAMA_NATIVE) \
+		$(LLAMA_GPU_FLAGS) \
 		$(LLAMA_CMAKE_FLAGS)
 	cmake --build $(LLAMA_BUILD) --config Release -j$(NPROC) --target llama-server
 
@@ -100,9 +121,26 @@ $(LUA_LIB):
 # --- kora binary ---
 # kora needs llama-server at ./llama-server (next to it) for the supervisor to
 # exec, so force-build the dep and fail loud if the copy fails.
+#
+# On Linux, llama-server is dynamically linked against libllama.so /
+# libggml*.so. For the dev tree to be runnable without `make install`, copy
+# the core .so files next to llama-server and rpath them so $ORIGIN finds
+# everything. (On Mac, llama-server is statically linked — nothing else to
+# copy.)
 $(BIN): $(OBJ) $(LUA_LIB) $(LLAMA_SERVER)
 	$(CXX) -o $@ $(OBJ) $(LUA_LIB) $(LDFLAGS) $(PLATFORM_LIBS)
 	cp -f $(LLAMA_SERVER) ./llama-server
+ifneq ($(UNAME_S),Darwin)
+	cp -f $(LLAMA_BUILD)/bin/libllama.so ./
+	cp -f $(LLAMA_BUILD)/bin/libggml.so ./
+	cp -f $(LLAMA_BUILD)/bin/libggml-base.so ./
+	mkdir -p ./backends
+	cp -f $(LLAMA_BUILD)/bin/libggml-cpu.so ./backends/
+	cp -f $(LLAMA_BUILD)/bin/libggml-vulkan.so ./backends/
+	patchelf --set-rpath '$$ORIGIN' ./llama-server
+	patchelf --set-rpath '$$ORIGIN/..' ./backends/libggml-cpu.so
+	patchelf --set-rpath '$$ORIGIN/..' ./backends/libggml-vulkan.so
+endif
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -119,9 +157,12 @@ $(MD4C_OBJ): $(MD4C_SRC)
 clean:
 	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
 	rm -f $(TEST_BINS) $(TEST_OBJ)
+	# Linux dev tree: drop the copied core libs and plugin dir.
+	rm -f libllama.so libggml.so libggml-base.so
+	rm -rf backends
 
 clean-all: clean
-	rm -rf $(LLAMA_BUILD)
+	rm -rf $(LLAMA_BUILD) $(LLAMA_CUDA_BUILD)
 	$(MAKE) -C vendor/lua clean
 
 # --- tests ---
@@ -187,18 +228,48 @@ test: $(TEST_BINS)
 		echo "  all tests passed ($$total_checks checks across $$total_groups tests in $(words $(TEST_BINS)) binaries)"; \
 	fi
 
+KORA_LIB_DIR = $(PREFIX)/lib/kora
+BACKENDS_DIR = $(KORA_LIB_DIR)/backends
+
 install: $(BIN) $(LLAMA_SERVER)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
 	mkdir -p $(DESTDIR)$(LUADIR)/core
 	cp -f $(BIN) $(DESTDIR)$(PREFIX)/bin
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	cp -f lua/core/*.lua $(DESTDIR)$(LUADIR)/core/
+ifeq ($(UNAME_S),Darwin)
+	# macOS: single statically-linked llama-server (Metal embedded).
 	cp -f $(LLAMA_SERVER) $(DESTDIR)$(PREFIX)/bin/llama-server
 	chmod 755 $(DESTDIR)$(PREFIX)/bin/llama-server
-	cp -f lua/core/*.lua $(DESTDIR)$(LUADIR)/core/
+else
+	# Linux: shared-lib layout. llama-server + core .so files live under
+	# /usr/lib/kora/, plugins under /usr/lib/kora/backends/. A symlink in
+	# /usr/bin keeps kora's llama_server_path() lookup (sibling of kora)
+	# working — kora resolves the symlink with realpath() at runtime to
+	# derive the backends dir.
+	mkdir -p $(DESTDIR)$(KORA_LIB_DIR)
+	mkdir -p $(DESTDIR)$(BACKENDS_DIR)
+	cp -f $(LLAMA_SERVER)                       $(DESTDIR)$(KORA_LIB_DIR)/llama-server
+	chmod 755 $(DESTDIR)$(KORA_LIB_DIR)/llama-server
+	cp -f $(LLAMA_BUILD)/bin/libllama.so        $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -f $(LLAMA_BUILD)/bin/libggml.so         $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -f $(LLAMA_BUILD)/bin/libggml-base.so    $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -f $(LLAMA_BUILD)/bin/libggml-cpu.so     $(DESTDIR)$(BACKENDS_DIR)/
+	cp -f $(LLAMA_BUILD)/bin/libggml-vulkan.so  $(DESTDIR)$(BACKENDS_DIR)/
+	# rpath = $$ORIGIN means the loader looks in the file's own dir.
+	# llama-server finds its sibling core libs; plugins find core libs
+	# one level up via $$ORIGIN/...
+	patchelf --set-rpath '$$ORIGIN'    $(DESTDIR)$(KORA_LIB_DIR)/llama-server
+	patchelf --set-rpath '$$ORIGIN/..' $(DESTDIR)$(BACKENDS_DIR)/libggml-cpu.so
+	patchelf --set-rpath '$$ORIGIN/..' $(DESTDIR)$(BACKENDS_DIR)/libggml-vulkan.so
+	# Symlink so /usr/bin/llama-server works (PATH lookup, scripts).
+	ln -sf ../lib/kora/llama-server $(DESTDIR)$(PREFIX)/bin/llama-server
+endif
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
 	rm -f $(DESTDIR)$(PREFIX)/bin/llama-server
+	rm -rf $(DESTDIR)$(KORA_LIB_DIR)
 	rm -rf $(DESTDIR)$(LUADIR)
 
 # --- debian package ---
@@ -224,4 +295,66 @@ deb: debian/control.in
 	@echo
 	@echo "  built $(DEB_FILE)"
 
-.PHONY: all clean clean-all install uninstall test deb
+# --- cuda plugin ---
+# `make cuda-plugin` builds JUST the CUDA backend as a shared library plugin
+# (no llama-server, no other backends). Must run inside an nvidia/cuda devel
+# container — see Dockerfile.cuda-build. Output: build-cuda/bin/libggml-cuda.so.
+LLAMA_CUDA_BUILD = vendor/llama.cpp/build-cuda
+
+cuda-plugin:
+	cmake -S vendor/llama.cpp -B $(LLAMA_CUDA_BUILD) \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DLLAMA_BUILD_TESTS=OFF \
+		-DLLAMA_BUILD_EXAMPLES=OFF \
+		-DLLAMA_BUILD_TOOLS=OFF \
+		-DLLAMA_BUILD_SERVER=OFF \
+		-DLLAMA_BUILD_COMMON=OFF \
+		-DBUILD_SHARED_LIBS=ON \
+		-DGGML_BACKEND_DL=ON \
+		-DGGML_CPU=OFF \
+		-DGGML_CUDA=ON
+	cmake --build $(LLAMA_CUDA_BUILD) --config Release -j$(NPROC) --target ggml-cuda
+
+# `make cuda-deb` produces dist/kora-cuda_<version>_<arch>.deb — a thin addon
+# package that just drops libggml-cuda.so + bundled cuBLAS into
+# /usr/lib/kora/backends/. Depends on the matching kora package; installing
+# it pulls kora in if not present.
+DEB_CUDA_STAGE := dist/deb-cuda-stage
+DEB_CUDA_FILE  := dist/kora-cuda_$(DEB_VERSION)_$(DEB_ARCH).deb
+
+# Backend install path inside the .deb. Hardcoded to /usr/lib/... rather
+# than $(BACKENDS_DIR) because $(PREFIX) defaults to /usr/local and the
+# Debian package always wants /usr; matches the path kora's supervisor
+# exports as GGML_BACKEND_PATH on Linux.
+DEB_CUDA_BACKENDS = /usr/lib/kora/backends
+
+# CUDA runtime libraries to bundle inside the .deb so users don't need to add
+# NVIDIA's apt repo. Resolved from CUDA_HOME (set in the build container).
+CUDA_HOME ?= /usr/local/cuda
+CUDA_BUNDLED_LIBS = libcudart.so.12 libcublas.so.12 libcublasLt.so.12
+
+cuda-deb: cuda-plugin debian/control-cuda.in
+	rm -rf $(DEB_CUDA_STAGE)
+	mkdir -p $(DEB_CUDA_STAGE)$(DEB_CUDA_BACKENDS)
+	cp -f $(LLAMA_CUDA_BUILD)/bin/libggml-cuda.so $(DEB_CUDA_STAGE)$(DEB_CUDA_BACKENDS)/
+	# Bundle cuBLAS / cudaRt next to the plugin. dereference symlinks (-L)
+	# so the .deb carries the real shared object, not a dangling link.
+	for lib in $(CUDA_BUNDLED_LIBS); do \
+		cp -fL $(CUDA_HOME)/lib64/$$lib $(DEB_CUDA_STAGE)$(DEB_CUDA_BACKENDS)/; \
+	done
+	# rpath so libggml-cuda.so finds (a) its sibling cuBLAS libs in the
+	# same dir, and (b) libggml-base.so in the parent /usr/lib/kora/ dir
+	# (shipped by the kora package, not duplicated here). $$ORIGIN is
+	# the .so's own dir at load time.
+	patchelf --set-rpath '$$ORIGIN:$$ORIGIN/..' \
+	    $(DEB_CUDA_STAGE)$(DEB_CUDA_BACKENDS)/libggml-cuda.so
+	mkdir -p $(DEB_CUDA_STAGE)/DEBIAN
+	sed -e 's|__VERSION__|$(DEB_VERSION)|g' \
+	    -e 's|__ARCH__|$(DEB_ARCH)|g' \
+	    debian/control-cuda.in > $(DEB_CUDA_STAGE)/DEBIAN/control
+	mkdir -p dist
+	fakeroot dpkg-deb --build --root-owner-group $(DEB_CUDA_STAGE) $(DEB_CUDA_FILE)
+	@echo
+	@echo "  built $(DEB_CUDA_FILE)"
+
+.PHONY: all clean clean-all install uninstall test deb cuda-plugin cuda-deb

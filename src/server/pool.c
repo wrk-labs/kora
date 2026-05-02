@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -51,11 +53,74 @@ static long now_ns(void)
 	return (long)ts.tv_sec * 1000000000L + ts.tv_nsec;
 }
 
+#if defined(__linux__)
+/* Resolve the backends directory: <real-dir-of-llama-server>/backends. Uses
+ * realpath so the prod symlink (/usr/bin/llama-server -> /usr/lib/kora/...)
+ * lands at /usr/lib/kora/backends, while the dev tree (./llama-server)
+ * lands at ./backends. Caller-provided buffer must be PATH_MAX. Returns
+ * pointer to buf on success, NULL on failure. */
+static const char *resolve_backends_dir(char *buf, size_t bufsz)
+{
+	char real_path[PATH_MAX];
+	if (!realpath(llama_server_path(), real_path)) return NULL;
+	char *slash = strrchr(real_path, '/');
+	if (!slash) return NULL;
+	*slash = '\0';
+	if ((size_t)snprintf(buf, bufsz, "%s/backends", real_path) >= bufsz) return NULL;
+	return buf;
+}
+
+/* Scan the backend plugin directory and log which GPU backends are
+ * available. Purely informational — llama-server still picks the best one
+ * at runtime via ggml's loader. Helps users confirm whether kora-cuda is
+ * actually installed alongside the base kora package. */
+static void log_available_backends(void)
+{
+	char buf[PATH_MAX];
+	const char *path = getenv("GGML_BACKEND_PATH");
+	if (!path || !*path) path = resolve_backends_dir(buf, sizeof buf);
+	if (!path) {
+		fprintf(stderr, "kora: backend dir not resolvable — running CPU-only\n");
+		return;
+	}
+
+	DIR *d = opendir(path);
+	if (!d) {
+		fprintf(stderr, "kora: backend dir %s not found — running CPU-only\n", path);
+		return;
+	}
+
+	int have_cpu = 0, have_vulkan = 0, have_cuda = 0, have_metal = 0;
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		if (strcmp(e->d_name, "libggml-cpu.so")    == 0) have_cpu    = 1;
+		if (strcmp(e->d_name, "libggml-vulkan.so") == 0) have_vulkan = 1;
+		if (strcmp(e->d_name, "libggml-cuda.so")   == 0) have_cuda   = 1;
+		if (strcmp(e->d_name, "libggml-metal.so")  == 0) have_metal  = 1;
+	}
+	closedir(d);
+
+	fprintf(stderr, "kora: backends available:%s%s%s%s\n",
+	        have_cuda   ? " cuda"   : "",
+	        have_vulkan ? " vulkan" : "",
+	        have_metal  ? " metal"  : "",
+	        have_cpu    ? " cpu"    : "");
+	if (!have_cuda && !have_vulkan && !have_metal) {
+		fprintf(stderr, "kora: no GPU backend found — install kora-cuda for "
+		                "NVIDIA, or libvulkan1 + a Vulkan driver for "
+		                "AMD/Intel/NVIDIA generic\n");
+	}
+}
+#endif
+
 void kora_pool_init(int cap, int ctx_size, int parallel)
 {
 	if (cap >= 1 && cap <= KORA_POOL_MAX_RESIDENT) g_cap = cap;
 	if (ctx_size > 0) g_ctx_size = ctx_size;
 	if (parallel > 0) g_parallel = parallel;
+#if defined(__linux__)
+	log_available_backends();
+#endif
 }
 
 void kora_pool_set_default_model(const char *m)
@@ -274,6 +339,18 @@ int kora_pool_ensure_ready(const char *requested, int *out_slot)
 		snprintf(port_s, sizeof port_s, "%d", port);
 		snprintf(ctx_s,  sizeof ctx_s,  "%d", ctx);
 		snprintf(par_s,  sizeof par_s,  "%d", parallel);
+#if defined(__linux__)
+		/* On Linux, llama-server uses ggml's dynamic backend loader: it
+		 * dlopens libggml-{cpu,vulkan,cuda}.so from GGML_BACKEND_PATH
+		 * at startup. Resolve to the backends/ dir adjacent to the real
+		 * llama-server file: in a .deb install that's /usr/lib/kora/
+		 * backends; in a dev tree it's ./backends/. The optional kora-
+		 * cuda .deb drops libggml-cuda.so into the prod path. setenv
+		 * with overwrite=0 so a dev-set GGML_BACKEND_PATH wins. */
+		char backends_buf[PATH_MAX];
+		const char *backends = resolve_backends_dir(backends_buf, sizeof backends_buf);
+		if (backends) setenv("GGML_BACKEND_PATH", backends, 0);
+#endif
 		/* execlp searches PATH only if the argument has no slash —
 		 * an absolute path from llama_server_path() is used as-is, while
 		 * the bare "llama-server" fallback gets a real PATH lookup. */

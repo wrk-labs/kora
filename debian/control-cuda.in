@@ -1,0 +1,21 @@
+Package: kora-cuda
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: __ARCH__
+Maintainer: willgcr <hello@willgcr.me>
+Depends: kora (>= __VERSION__), libc6
+Recommends: nvidia-driver-libs | libnvidia-compute-550
+Homepage: https://wrklabs.org/kora
+Description: CUDA backend addon for kora
+ Adds the CUDA backend plugin to kora's runtime backend directory, so
+ kora's vendored llama.cpp uses CUDA on NVIDIA GPUs instead of Vulkan.
+ .
+ This is a thin addon — it ships only libggml-cuda.so plus the bundled
+ CUDA runtime libraries (libcudart, libcublas, libcublasLt). All of
+ kora's actual functionality lives in the kora package, which this
+ package depends on; installing kora-cuda alone pulls kora in.
+ .
+ Requires an NVIDIA GPU and a working NVIDIA driver. To remove CUDA
+ acceleration without uninstalling kora, simply remove this package —
+ kora falls back to Vulkan or CPU automatically.

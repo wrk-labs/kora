@@ -6,10 +6,12 @@
 #
 # Version is read from the VERSION file at the repo root.
 
-FROM debian:bullseye-slim
-# build against oldest still-supported glibc so the resulting .deb runs on
-# bullseye, bookworm, trixie, and ubuntu 22.04+. switch to bookworm when
-# bullseye hits EOL (~aug 2026).
+FROM debian:bookworm-slim
+# Bookworm (glibc 2.36) is the build base. We were on bullseye-slim before
+# for older-glibc back-compat, but the Vulkan backend needs `glslc` (Google
+# shaderc) which only lands in main from bookworm onwards. Bookworm-built
+# .debs run on bookworm/trixie/Ubuntu 24.04+; users on bullseye/Ubuntu 22.04
+# stay on the pre-GPU kora release line.
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,6 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcurl4-openssl-dev \
         libsqlite3-dev \
         libncurses-dev \
+        libvulkan-dev \
+        glslc \
+        patchelf \
         xxd \
         dpkg-dev \
         fakeroot \

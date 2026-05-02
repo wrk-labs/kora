@@ -4,10 +4,17 @@ Section: utils
 Priority: optional
 Architecture: __ARCH__
 Maintainer: willgcr <hello@willgcr.me>
-Depends: libc6, libstdc++6, libcurl4t64 | libcurl4, libsqlite3-0, libncursesw6, libgomp1
+Depends: libc6, libstdc++6, libcurl4t64 | libcurl4, libsqlite3-0, libncursesw6, libgomp1, libvulkan1
+Recommends: mesa-vulkan-drivers | nvidia-driver-libs-vulkan
+Suggests: kora-cuda
 Homepage: https://wrklabs.org/kora
 Description: terminal-based local LLM chat client
  Kora is a terminal-based chat client for local LLMs, built on llama.cpp.
  Includes a three-pane TUI, a multi-model supervisor with an
  OpenAI-compatible HTTP API, SQLite-backed session persistence, and
  markdown rendering.
+ .
+ GPU acceleration is auto-detected at runtime: this package ships the
+ Vulkan backend (works on NVIDIA, AMD, and Intel GPUs with the right
+ driver). Install kora-cuda alongside for the CUDA backend on NVIDIA
+ hardware. Falls back to CPU when no GPU is available.
