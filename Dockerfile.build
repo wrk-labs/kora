@@ -6,30 +6,78 @@
 #
 # Version is read from the VERSION file at the repo root.
 
-FROM debian:bookworm-slim
-# Bookworm (glibc 2.36) is the build base. We were on bullseye-slim before
-# for older-glibc back-compat, but the Vulkan backend needs `glslc` (Google
-# shaderc) which only lands in main from bookworm onwards. Bookworm-built
-# .debs run on bookworm/trixie/Ubuntu 24.04+; users on bullseye/Ubuntu 22.04
-# stay on the pre-GPU kora release line.
+FROM debian:bullseye-slim
+# Bullseye (glibc 2.31) is the build base — gives us the widest runtime
+# compatibility (Debian bullseye/bookworm/trixie, Ubuntu 20.04+, Mint 20+,
+# any derivative on glibc >= 2.31). We bring in glslc (shaderc) and recent
+# Vulkan-Headers ourselves below, so the OS not shipping them isn't a
+# blocker. Earlier rc1 used bookworm-slim because bookworm's apt has glslc;
+# that locked out glibc < 2.36 users including Ubuntu 22.04 / Mint 21.
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
-        cmake \
         git \
         pkg-config \
         libcurl4-openssl-dev \
         libsqlite3-dev \
         libncurses-dev \
         libvulkan-dev \
-        glslc \
         patchelf \
         xxd \
         dpkg-dev \
         fakeroot \
         ca-certificates \
+        python3 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Bullseye main has cmake 3.18; shaderc v2026.2 wants >= 3.22.1. bullseye-
+# backports got archived when bookworm went stable so it's not a clean source
+# anymore. Drop in Kitware's official precompiled cmake (works on glibc >=
+# 2.17, supports amd64 + arm64). Pinned to 3.30.x to avoid cmake 4.x policy
+# changes biting llama.cpp/submodules.
+ARG CMAKE_VERSION=3.30.9
+RUN ARCH="$(dpkg --print-architecture)" \
+    && case "$ARCH" in \
+         amd64)  CMAKE_ARCH=x86_64  ;; \
+         arm64)  CMAKE_ARCH=aarch64 ;; \
+         *)      echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz" \
+       | tar -xz --strip-components=1 -C /usr/local
+
+# Build shaderc (provides glslc) from source — bullseye doesn't ship a glslc
+# package; bookworm added one but we left bookworm to keep the glibc baseline
+# low. shaderc bundles glslang + SPIRV-Tools as submodules fetched by its
+# git-sync-deps script (hence python3 above). Pinned to a release tag for
+# reproducibility; bump deliberately. ~5-8 min one-time cost, cached as a
+# docker layer afterward.
+ARG SHADERC_TAG=v2026.2
+RUN git clone --depth 1 --branch $SHADERC_TAG \
+        https://github.com/google/shaderc.git /tmp/shaderc \
+    && cd /tmp/shaderc && ./utils/git-sync-deps \
+    && cmake -S /tmp/shaderc -B /tmp/shaderc/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSHADERC_SKIP_TESTS=ON \
+        -DSHADERC_SKIP_EXAMPLES=ON \
+        -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+    && cmake --build /tmp/shaderc/build --target install -j$(nproc) \
+    && rm -rf /tmp/shaderc
+
+# Bullseye's libvulkan-dev is 1.2.162; llama.cpp's vulkan backend uses
+# VK_EXT_layer_settings (vk::LayerSettingEXT et al.) which Vulkan-Hpp only
+# exposes from 1.3.275+. Overlay newer header-only Vulkan-Headers (includes
+# vulkan.hpp) on top of the system loader — runtime ABI is unaffected since
+# the dispatcher is loaded dynamically. Pinned to a vulkan-sdk-* tag (LunarG
+# stable release marker) for reproducible builds; bump deliberately.
+ARG VULKAN_HEADERS_TAG=vulkan-sdk-1.4.341.0
+RUN git clone --depth 1 --branch $VULKAN_HEADERS_TAG \
+        https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vk-headers \
+    && cmake -S /tmp/vk-headers -B /tmp/vk-headers/build -DCMAKE_INSTALL_PREFIX=/usr \
+    && cmake --install /tmp/vk-headers/build \
+    && rm -rf /tmp/vk-headers
 
 WORKDIR /src

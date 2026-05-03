@@ -80,7 +80,7 @@ static const char *resolve_backends_dir(char *buf, size_t bufsz)
 static void log_available_backends(void)
 {
 	char buf[PATH_MAX];
-	const char *path = getenv("GGML_BACKEND_PATH");
+	const char *path = getenv("KORA_BACKENDS_DIR");
 	if (!path || !*path) path = resolve_backends_dir(buf, sizeof buf);
 	if (!path) {
 		fprintf(stderr, "kora: backend dir not resolvable — running CPU-only\n");
@@ -343,16 +343,22 @@ int kora_pool_ensure_ready(const char *requested, int *out_slot)
 		snprintf(ctx_s,  sizeof ctx_s,  "%d", ctx);
 		snprintf(par_s,  sizeof par_s,  "%d", parallel);
 #if defined(__linux__)
-		/* On Linux, llama-server uses ggml's dynamic backend loader: it
-		 * dlopens libggml-{cpu,vulkan,cuda}.so from GGML_BACKEND_PATH
-		 * at startup. Resolve to the backends/ dir adjacent to the real
-		 * llama-server file: in a .deb install that's /usr/lib/kora/
-		 * backends; in a dev tree it's ./backends/. The optional kora-
-		 * cuda .deb drops libggml-cuda.so into the prod path. setenv
-		 * with overwrite=0 so a dev-set GGML_BACKEND_PATH wins. */
+		/* On Linux, llama-server uses ggml's dynamic backend loader. ggml
+		 * scans get_executable_path() and fs::current_path() for files
+		 * matching libggml-${name}*.so. There's no env var that sets the
+		 * scan directory (GGML_BACKEND_PATH is a single-.so out-of-tree
+		 * loader, not a dir scan), so chdir to the backends/ dir adjacent
+		 * to the real llama-server before exec. In a .deb install that's
+		 * /usr/lib/kora/backends; in a dev tree it's ./backends/. The
+		 * optional kora-cuda .deb drops libggml-cuda.so into the prod path.
+		 * KORA_BACKENDS_DIR overrides the auto-resolved path for testing. */
 		char backends_buf[PATH_MAX];
-		const char *backends = resolve_backends_dir(backends_buf, sizeof backends_buf);
-		if (backends) setenv("GGML_BACKEND_PATH", backends, 0);
+		const char *backends = getenv("KORA_BACKENDS_DIR");
+		if (!backends || !*backends)
+			backends = resolve_backends_dir(backends_buf, sizeof backends_buf);
+		if (backends && chdir(backends) != 0)
+			fprintf(stderr, "kora: chdir(%s) failed: %s\n",
+			        backends, strerror(errno));
 #endif
 		/* execlp searches PATH only if the argument has no slash —
 		 * an absolute path from llama_server_path() is used as-is, while

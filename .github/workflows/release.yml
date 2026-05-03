@@ -27,9 +27,10 @@ jobs:
     name: build kora .deb (${{ matrix.arch }})
     needs: verify
     runs-on: ${{ matrix.runner }}
-    container: debian:bookworm-slim   # bookworm packages glslc (needed for
-                                      # llama.cpp Vulkan backend); .deb runs
-                                      # on bookworm/trixie/Ubuntu 24.04+.
+    container: debian:bullseye-slim   # bullseye gives us the widest glibc
+                                      # baseline (2.31). glslc + Vulkan-Headers
+                                      # are brought in below since bullseye
+                                      # apt is too old for both.
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +44,58 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential cmake git pkg-config \
+            build-essential git pkg-config \
             libcurl4-openssl-dev libsqlite3-dev libncurses-dev \
-            libvulkan-dev glslc patchelf \
-            xxd dpkg-dev fakeroot ca-certificates
+            libvulkan-dev patchelf \
+            xxd dpkg-dev fakeroot ca-certificates \
+            python3 curl
+
+      - name: install cmake
+        # Bullseye main has cmake 3.18; shaderc v2026.2 wants >= 3.22.1.
+        # Drop in Kitware's official precompiled cmake. Pinned to 3.30.x
+        # to avoid cmake 4.x policy changes biting llama.cpp/submodules.
+        env:
+          CMAKE_VERSION: 3.30.9
+        run: |
+          ARCH="$(dpkg --print-architecture)"
+          case "$ARCH" in
+            amd64) CMAKE_ARCH=x86_64 ;;
+            arm64) CMAKE_ARCH=aarch64 ;;
+            *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local
+
+      - name: build shaderc (provides glslc)
+        # Bullseye doesn't ship glslc. Build from source; pinned tag for
+        # reproducibility. Mirrors Dockerfile.build.
+        env:
+          SHADERC_TAG: v2026.2
+        run: |
+          git clone --depth 1 --branch "$SHADERC_TAG" \
+            https://github.com/google/shaderc.git /tmp/shaderc
+          cd /tmp/shaderc && ./utils/git-sync-deps
+          cmake -S /tmp/shaderc -B /tmp/shaderc/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build /tmp/shaderc/build --target install -j$(nproc)
+          rm -rf /tmp/shaderc
+
+      - name: install newer Vulkan-Headers
+        # Bullseye's libvulkan-dev is 1.2.162; llama.cpp's vulkan backend
+        # needs vk::LayerSettingEXT et al. from Vulkan-Hpp 1.3.275+. Overlay
+        # header-only Vulkan-Headers; runtime ABI unaffected (dynamic dispatch).
+        env:
+          VULKAN_HEADERS_TAG: vulkan-sdk-1.4.341.0
+        run: |
+          git clone --depth 1 --branch "$VULKAN_HEADERS_TAG" \
+            https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vk-headers
+          cmake -S /tmp/vk-headers -B /tmp/vk-headers/build -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --install /tmp/vk-headers/build
+          rm -rf /tmp/vk-headers
 
       - name: checkout
         uses: actions/checkout@v4

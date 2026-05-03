@@ -3,6 +3,7 @@ Version: __VERSION__
 Section: utils
 Priority: optional
 Architecture: __ARCH__
+Installed-Size: __INSTALLED_SIZE__
 Maintainer: willgcr <hello@willgcr.me>
 Depends: kora (>= __VERSION__), libc6
 Recommends: nvidia-driver-libs | libnvidia-compute-550

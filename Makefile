@@ -131,12 +131,17 @@ $(BIN): $(OBJ) $(LUA_LIB) $(LLAMA_SERVER)
 	$(CXX) -o $@ $(OBJ) $(LUA_LIB) $(LDFLAGS) $(PLATFORM_LIBS)
 	cp -f $(LLAMA_SERVER) ./llama-server
 ifneq ($(UNAME_S),Darwin)
-	cp -f $(LLAMA_BUILD)/bin/libllama.so ./
-	cp -f $(LLAMA_BUILD)/bin/libggml.so ./
-	cp -f $(LLAMA_BUILD)/bin/libggml-base.so ./
+	# llama-server's NEEDED entries are SONAME-versioned (libllama.so.0,
+	# libggml.so.0, libggml-base.so.0, libmtmd.so.0), so we need to preserve
+	# the symlink chain (libfoo.so -> libfoo.so.0 -> libfoo.so.0.X.Y). cp -a
+	# preserves symlinks; the glob captures all three names per lib.
+	cp -af $(LLAMA_BUILD)/bin/libllama.so* ./
+	cp -af $(LLAMA_BUILD)/bin/libggml.so* ./
+	cp -af $(LLAMA_BUILD)/bin/libggml-base.so* ./
+	cp -af $(LLAMA_BUILD)/bin/libmtmd.so* ./
 	mkdir -p ./backends
-	cp -f $(LLAMA_BUILD)/bin/libggml-cpu.so ./backends/
-	cp -f $(LLAMA_BUILD)/bin/libggml-vulkan.so ./backends/
+	cp -af $(LLAMA_BUILD)/bin/libggml-cpu.so* ./backends/
+	cp -af $(LLAMA_BUILD)/bin/libggml-vulkan.so* ./backends/
 	patchelf --set-rpath '$$ORIGIN' ./llama-server
 	patchelf --set-rpath '$$ORIGIN/..' ./backends/libggml-cpu.so
 	patchelf --set-rpath '$$ORIGIN/..' ./backends/libggml-vulkan.so
@@ -157,8 +162,9 @@ $(MD4C_OBJ): $(MD4C_SRC)
 clean:
 	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
 	rm -f $(TEST_BINS) $(TEST_OBJ)
-	# Linux dev tree: drop the copied core libs and plugin dir.
-	rm -f libllama.so libggml.so libggml-base.so
+	# Linux dev tree: drop the copied core libs and plugin dir. Glob covers
+	# the SONAME chain (libfoo.so, libfoo.so.0, libfoo.so.0.X.Y).
+	rm -f libllama.so* libggml.so* libggml-base.so* libmtmd.so*
 	rm -rf backends
 
 clean-all: clean
@@ -249,13 +255,17 @@ else
 	# derive the backends dir.
 	mkdir -p $(DESTDIR)$(KORA_LIB_DIR)
 	mkdir -p $(DESTDIR)$(BACKENDS_DIR)
-	cp -f $(LLAMA_SERVER)                       $(DESTDIR)$(KORA_LIB_DIR)/llama-server
+	cp -f $(LLAMA_SERVER)                        $(DESTDIR)$(KORA_LIB_DIR)/llama-server
 	chmod 755 $(DESTDIR)$(KORA_LIB_DIR)/llama-server
-	cp -f $(LLAMA_BUILD)/bin/libllama.so        $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -f $(LLAMA_BUILD)/bin/libggml.so         $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -f $(LLAMA_BUILD)/bin/libggml-base.so    $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -f $(LLAMA_BUILD)/bin/libggml-cpu.so     $(DESTDIR)$(BACKENDS_DIR)/
-	cp -f $(LLAMA_BUILD)/bin/libggml-vulkan.so  $(DESTDIR)$(BACKENDS_DIR)/
+	# Preserve SONAME symlink chains; llama-server's NEEDED uses libfoo.so.0
+	# names, so just copying libfoo.so (the unversioned symlink target) leaves
+	# the loader unable to resolve the deps. -a keeps the symlinks intact.
+	cp -af $(LLAMA_BUILD)/bin/libllama.so*       $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -af $(LLAMA_BUILD)/bin/libggml.so*        $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -af $(LLAMA_BUILD)/bin/libggml-base.so*   $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -af $(LLAMA_BUILD)/bin/libmtmd.so*        $(DESTDIR)$(KORA_LIB_DIR)/
+	cp -af $(LLAMA_BUILD)/bin/libggml-cpu.so*    $(DESTDIR)$(BACKENDS_DIR)/
+	cp -af $(LLAMA_BUILD)/bin/libggml-vulkan.so* $(DESTDIR)$(BACKENDS_DIR)/
 	# rpath = $$ORIGIN means the loader looks in the file's own dir.
 	# llama-server finds its sibling core libs; plugins find core libs
 	# one level up via $$ORIGIN/...
@@ -287,8 +297,13 @@ deb: debian/control.in
 	rm -rf $(DEB_STAGE)
 	$(MAKE) install DESTDIR=$(DEB_STAGE) PREFIX=/usr LUADIR=/usr/share/kora/lua
 	mkdir -p $(DEB_STAGE)/DEBIAN
+	# Installed-Size is in KiB (debian policy), excluding DEBIAN/ metadata.
+	# dpkg-deb does NOT auto-compute it; without it apt can't show how much
+	# space the package will use or free.
+	INSTALLED_SIZE=$$(du -sk --exclude=DEBIAN $(DEB_STAGE) | cut -f1) && \
 	sed -e 's|__VERSION__|$(DEB_VERSION)|g' \
 	    -e 's|__ARCH__|$(DEB_ARCH)|g' \
+	    -e "s|__INSTALLED_SIZE__|$$INSTALLED_SIZE|g" \
 	    debian/control.in > $(DEB_STAGE)/DEBIAN/control
 	mkdir -p dist
 	fakeroot dpkg-deb --build --root-owner-group $(DEB_STAGE) $(DEB_FILE)
@@ -349,8 +364,11 @@ cuda-deb: cuda-plugin debian/control-cuda.in
 	patchelf --set-rpath '$$ORIGIN:$$ORIGIN/..' \
 	    $(DEB_CUDA_STAGE)$(DEB_CUDA_BACKENDS)/libggml-cuda.so
 	mkdir -p $(DEB_CUDA_STAGE)/DEBIAN
+	# Installed-Size in KiB; see deb target above for why this is manual.
+	INSTALLED_SIZE=$$(du -sk --exclude=DEBIAN $(DEB_CUDA_STAGE) | cut -f1) && \
 	sed -e 's|__VERSION__|$(DEB_VERSION)|g' \
 	    -e 's|__ARCH__|$(DEB_ARCH)|g' \
+	    -e "s|__INSTALLED_SIZE__|$$INSTALLED_SIZE|g" \
 	    debian/control-cuda.in > $(DEB_CUDA_STAGE)/DEBIAN/control
 	mkdir -p dist
 	fakeroot dpkg-deb --build --root-owner-group $(DEB_CUDA_STAGE) $(DEB_CUDA_FILE)
