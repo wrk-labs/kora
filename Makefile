@@ -51,7 +51,7 @@ ifeq ($(UNAME_S),Darwin)
   PLATFORM_LIBS = -lm -lpthread $(NCURSES_LIB) -lsqlite3
   # Metal is the only realistic GPU on macOS. Compile it in and embed the
   # shader library so the bottle is a single self-contained binary — no
-  # plugin .so files, no ggml-metal.metal sidecar, no GGML_BACKEND_PATH.
+  # plugin .so files, no ggml-metal.metal sidecar, no backend dir.
   LLAMA_GPU_FLAGS = -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
 else
   NPROC := $(shell nproc)
@@ -64,8 +64,26 @@ else
   # and Vulkan backends as .so files under /usr/lib/kora/backends/; the
   # optional kora-cuda .deb drops libggml-cuda.so into the same directory
   # and llama-server picks the best backend at runtime.
-  LLAMA_GPU_FLAGS = -DGGML_BACKEND_DL=ON -DGGML_CPU=ON -DGGML_VULKAN=ON
+  #
+  # `make CPU=1` drops Vulkan from the build for bare-metal dev iteration on
+  # hosts without glslc / Vulkan-Headers / libvulkan-dev installed. Useful
+  # when working on non-GPU code (TUI, supervisor, db, config) — full GPU
+  # builds still need docker (see `make docker-deb`) or a properly set up
+  # host (see README dev setup).
+  CPU ?= 0
+  BACKEND_LIBS    = ggml-cpu
+  LLAMA_GPU_FLAGS = -DGGML_BACKEND_DL=ON -DGGML_CPU=ON
+  ifneq ($(CPU),1)
+    BACKEND_LIBS    += ggml-vulkan
+    LLAMA_GPU_FLAGS += -DGGML_VULKAN=ON
+  endif
 endif
+
+# llama-server NEEDED entries reference libfoo.so.0 (SONAME-versioned), so we
+# ship the full symlink chain (libfoo.so -> libfoo.so.0 -> libfoo.so.0.X.Y)
+# next to it via cp -af. Listed in one place so $(BIN), install, and clean
+# all stay in sync.
+CORE_LIBS = libllama libggml libggml-base libmtmd
 
 # default target
 all: $(BIN) $(LLAMA_SERVER)
@@ -131,20 +149,11 @@ $(BIN): $(OBJ) $(LUA_LIB) $(LLAMA_SERVER)
 	$(CXX) -o $@ $(OBJ) $(LUA_LIB) $(LDFLAGS) $(PLATFORM_LIBS)
 	cp -f $(LLAMA_SERVER) ./llama-server
 ifneq ($(UNAME_S),Darwin)
-	# llama-server's NEEDED entries are SONAME-versioned (libllama.so.0,
-	# libggml.so.0, libggml-base.so.0, libmtmd.so.0), so we need to preserve
-	# the symlink chain (libfoo.so -> libfoo.so.0 -> libfoo.so.0.X.Y). cp -a
-	# preserves symlinks; the glob captures all three names per lib.
-	cp -af $(LLAMA_BUILD)/bin/libllama.so* ./
-	cp -af $(LLAMA_BUILD)/bin/libggml.so* ./
-	cp -af $(LLAMA_BUILD)/bin/libggml-base.so* ./
-	cp -af $(LLAMA_BUILD)/bin/libmtmd.so* ./
+	for lib in $(CORE_LIBS); do cp -af $(LLAMA_BUILD)/bin/$$lib.so* ./; done
 	mkdir -p ./backends
-	cp -af $(LLAMA_BUILD)/bin/libggml-cpu.so* ./backends/
-	cp -af $(LLAMA_BUILD)/bin/libggml-vulkan.so* ./backends/
+	for b in $(BACKEND_LIBS); do cp -af $(LLAMA_BUILD)/bin/lib$$b.so* ./backends/; done
 	patchelf --set-rpath '$$ORIGIN' ./llama-server
-	patchelf --set-rpath '$$ORIGIN/..' ./backends/libggml-cpu.so
-	patchelf --set-rpath '$$ORIGIN/..' ./backends/libggml-vulkan.so
+	for b in $(BACKEND_LIBS); do patchelf --set-rpath '$$ORIGIN/..' ./backends/lib$$b.so; done
 endif
 
 %.o: %.c
@@ -162,9 +171,8 @@ $(MD4C_OBJ): $(MD4C_SRC)
 clean:
 	rm -f $(BIN) llama-server $(OBJ) $(SCHEMA_HDR)
 	rm -f $(TEST_BINS) $(TEST_OBJ)
-	# Linux dev tree: drop the copied core libs and plugin dir. Glob covers
-	# the SONAME chain (libfoo.so, libfoo.so.0, libfoo.so.0.X.Y).
-	rm -f libllama.so* libggml.so* libggml-base.so* libmtmd.so*
+	# Linux dev tree: drop the copied core libs (SONAME chain) and plugin dir.
+	rm -f $(addsuffix .so*,$(CORE_LIBS))
 	rm -rf backends
 
 clean-all: clean
@@ -257,21 +265,12 @@ else
 	mkdir -p $(DESTDIR)$(BACKENDS_DIR)
 	cp -f $(LLAMA_SERVER)                        $(DESTDIR)$(KORA_LIB_DIR)/llama-server
 	chmod 755 $(DESTDIR)$(KORA_LIB_DIR)/llama-server
-	# Preserve SONAME symlink chains; llama-server's NEEDED uses libfoo.so.0
-	# names, so just copying libfoo.so (the unversioned symlink target) leaves
-	# the loader unable to resolve the deps. -a keeps the symlinks intact.
-	cp -af $(LLAMA_BUILD)/bin/libllama.so*       $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -af $(LLAMA_BUILD)/bin/libggml.so*        $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -af $(LLAMA_BUILD)/bin/libggml-base.so*   $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -af $(LLAMA_BUILD)/bin/libmtmd.so*        $(DESTDIR)$(KORA_LIB_DIR)/
-	cp -af $(LLAMA_BUILD)/bin/libggml-cpu.so*    $(DESTDIR)$(BACKENDS_DIR)/
-	cp -af $(LLAMA_BUILD)/bin/libggml-vulkan.so* $(DESTDIR)$(BACKENDS_DIR)/
-	# rpath = $$ORIGIN means the loader looks in the file's own dir.
-	# llama-server finds its sibling core libs; plugins find core libs
-	# one level up via $$ORIGIN/...
-	patchelf --set-rpath '$$ORIGIN'    $(DESTDIR)$(KORA_LIB_DIR)/llama-server
-	patchelf --set-rpath '$$ORIGIN/..' $(DESTDIR)$(BACKENDS_DIR)/libggml-cpu.so
-	patchelf --set-rpath '$$ORIGIN/..' $(DESTDIR)$(BACKENDS_DIR)/libggml-vulkan.so
+	for lib in $(CORE_LIBS); do cp -af $(LLAMA_BUILD)/bin/$$lib.so* $(DESTDIR)$(KORA_LIB_DIR)/; done
+	for b in $(BACKEND_LIBS); do cp -af $(LLAMA_BUILD)/bin/lib$$b.so* $(DESTDIR)$(BACKENDS_DIR)/; done
+	# rpath = $$ORIGIN means the loader looks in the file's own dir;
+	# plugins find core libs one level up via $$ORIGIN/...
+	patchelf --set-rpath '$$ORIGIN' $(DESTDIR)$(KORA_LIB_DIR)/llama-server
+	for b in $(BACKEND_LIBS); do patchelf --set-rpath '$$ORIGIN/..' $(DESTDIR)$(BACKENDS_DIR)/lib$$b.so; done
 	# Symlink so /usr/bin/llama-server works (PATH lookup, scripts).
 	ln -sf ../lib/kora/llama-server $(DESTDIR)$(PREFIX)/bin/llama-server
 endif
@@ -339,8 +338,8 @@ DEB_CUDA_FILE  := dist/kora-cuda_$(DEB_VERSION)_$(DEB_ARCH).deb
 
 # Backend install path inside the .deb. Hardcoded to /usr/lib/... rather
 # than $(BACKENDS_DIR) because $(PREFIX) defaults to /usr/local and the
-# Debian package always wants /usr; matches the path kora's supervisor
-# exports as GGML_BACKEND_PATH on Linux.
+# Debian package always wants /usr; matches the dir kora's supervisor
+# chdirs into before exec'ing llama-server on Linux.
 DEB_CUDA_BACKENDS = /usr/lib/kora/backends
 
 # CUDA runtime libraries to bundle inside the .deb so users don't need to add
@@ -375,4 +374,23 @@ cuda-deb: cuda-plugin debian/control-cuda.in
 	@echo
 	@echo "  built $(DEB_CUDA_FILE)"
 
-.PHONY: all clean clean-all install uninstall test deb cuda-plugin cuda-deb
+# --- docker wrappers ---
+# `make docker-deb` and `make docker-cuda-deb` reproduce CI's release builds
+# locally — useful for validating a release before tagging without setting
+# up shaderc/Vulkan-Headers/CUDA toolkit on the host. Slow first run (image
+# build), fast on subsequent runs (image cached). chown runs even if the
+# inner make fails (via $$rc), otherwise a partially-staged dist/ would be
+# left root-owned and need sudo to clean up.
+DOCKER ?= docker
+DOCKER_RUN = $(DOCKER) run --rm -v "$$PWD:/src" -w /src
+
+docker-deb:
+	$(DOCKER) build -f Dockerfile.build -t kora-build .
+	$(DOCKER_RUN) kora-build sh -c 'make deb; rc=$$?; chown -R $(shell id -u):$(shell id -g) .; exit $$rc'
+
+docker-cuda-deb:
+	$(DOCKER) build -f Dockerfile.cuda-build -t kora-cuda-build .
+	$(DOCKER_RUN) kora-cuda-build sh -c 'make cuda-deb; rc=$$?; chown -R $(shell id -u):$(shell id -g) .; exit $$rc'
+
+.PHONY: all clean clean-all install uninstall test deb cuda-plugin cuda-deb \
+        docker-deb docker-cuda-deb
