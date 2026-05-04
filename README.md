@@ -32,7 +32,7 @@ GPU automatically, no flags or config.
 
 ```
 curl -fsSL https://apt.wrklabs.org/key.asc | sudo tee /etc/apt/keyrings/wrklabs.asc
-echo "deb [signed-by=/etc/apt/keyrings/wrklabs.asc] https://apt.wrklabs.org stable main" \
+echo "deb [signed-by=/etc/apt/keyrings/wrklabs.asc arch=amd64,arm64] https://apt.wrklabs.org stable main" \
   | sudo tee /etc/apt/sources.list.d/wrklabs.list
 sudo apt update
 sudo apt install kora
