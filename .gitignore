@@ -1,5 +1,13 @@
 kora
 llama-server
+# core llama.cpp shared libs + backend plugins, copied next to the kora
+# binary by `make` on Linux (see Makefile). Cleaned by `make clean`,
+# but better to never have them tracked in the first place.
+libllama.so*
+libggml.so*
+libggml-base.so*
+libmtmd.so*
+backends/
 *.o
 src/core/schema_sql.h
 vendor/lua/src/lua
