@@ -155,7 +155,7 @@ static void *gen_thread_fn(void *arg)
 
 	if (rc != 0 && (!response || !*response)) {
 		free(response);
-		const char *err = "[error: chat request failed. is 'kora serve' running?]";
+		const char *err = "[error: chat request failed]";
 		tui_assistant_chunk(err, (int)strlen(err));
 		response = NULL;   /* don't persist an error as an assistant turn */
 
@@ -741,17 +741,29 @@ int main(int argc, char *argv[])
 			opts.model = preferred;
 		}
 		if (!opts.model) {
-			fprintf(stderr, "kora: no model specified\n"
-				"Usage: kora serve [model] [--port PORT] "
-				"[--ctx-size N] [--idle-timeout SECS] "
-				"[--pool-size N] [--parallel N]\n");
+			/* No model configured yet — exit cleanly so service managers
+			 * (systemd, launchd) don't treat us as failed and crash-loop.
+			 * The path/watch trigger will re-launch us once `kora pull`
+			 * writes ~/.kora/preferred_model. */
+			fprintf(stderr, "kora: no model configured; idle. "
+				"Run 'kora pull <model>' to get started.\n");
 			db_close();
-			return 1;
+			return 0;
 		}
 
 		db_close();
 		int rc = kora_server_run(&opts);
 		free(preferred);
+		if (rc == 2) {
+			/* Port already in use — likely another user on the same
+			 * machine is also running kora-serve. Exit cleanly so
+			 * service managers don't crash-loop us. */
+			fprintf(stderr, "kora: port %d already in use; another "
+				"kora-serve may be running. Use --port to "
+				"choose a different port.\n",
+				opts.public_port > 0 ? opts.public_port : 8818);
+			return 0;
+		}
 		return rc;
 	}
 
@@ -818,7 +830,7 @@ int main(int argc, char *argv[])
 		pthread_create(&poller_tid, NULL, daemon_poller_fn, pa);
 
 		if (!daemon_up) {
-			tui_log("Daemon unreachable at %s — run: kora serve <model>", base_url);
+			tui_log("Daemon not running yet — pull a model to start it.");
 		}
 
 		update_context_status(session, cfg->ctx_size);

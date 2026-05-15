@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl --global disable kora-serve.path >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#

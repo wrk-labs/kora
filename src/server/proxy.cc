@@ -294,7 +294,15 @@ extern "C" int kora_proxy_listen(int port)
 	g_srv->Delete(R"(.*)", handler);
 	g_srv->Patch(R"(.*)",  handler);
 
-	bool ok = g_srv->listen("127.0.0.1", port);
+	/* Split bind from accept so the caller can distinguish "port already in
+	 * use" (a clean exit) from "accept loop crashed" (a real failure). */
+	if (!g_srv->bind_to_port("127.0.0.1", port)) {
+		std::lock_guard<std::mutex> lk(g_srv_mu);
+		delete g_srv;
+		g_srv = nullptr;
+		return 2;
+	}
+	bool ok = g_srv->listen_after_bind();
 
 	{
 		std::lock_guard<std::mutex> lk(g_srv_mu);

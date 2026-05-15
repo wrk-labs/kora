@@ -273,11 +273,22 @@ else
 	for b in $(BACKEND_LIBS); do patchelf --set-rpath '$$ORIGIN/..' $(DESTDIR)$(BACKENDS_DIR)/lib$$b.so; done
 	# Symlink so /usr/bin/llama-server works (PATH lookup, scripts).
 	ln -sf ../lib/kora/llama-server $(DESTDIR)$(PREFIX)/bin/llama-server
+	# systemd user units — .path watches ~/.kora/preferred_model and triggers
+	# .service when a model is first pulled. ExecStart is substituted with
+	# the resolved $(PREFIX)/bin/kora so source installs work too.
+	mkdir -p $(DESTDIR)$(PREFIX)/lib/systemd/user
+	sed 's|__KORA_BIN__|$(PREFIX)/bin/kora|g' debian/kora-serve.service \
+	    > $(DESTDIR)$(PREFIX)/lib/systemd/user/kora-serve.service
+	chmod 644 $(DESTDIR)$(PREFIX)/lib/systemd/user/kora-serve.service
+	install -Dm644 debian/kora-serve.path \
+	    $(DESTDIR)$(PREFIX)/lib/systemd/user/kora-serve.path
 endif
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
 	rm -f $(DESTDIR)$(PREFIX)/bin/llama-server
+	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/kora-serve.service
+	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/user/kora-serve.path
 	rm -rf $(DESTDIR)$(KORA_LIB_DIR)
 	rm -rf $(DESTDIR)$(LUADIR)
 
@@ -304,6 +315,10 @@ deb: debian/control.in
 	    -e 's|__ARCH__|$(DEB_ARCH)|g' \
 	    -e "s|__INSTALLED_SIZE__|$$INSTALLED_SIZE|g" \
 	    debian/control.in > $(DEB_STAGE)/DEBIAN/control
+	# Maintainer scripts — enable the .path watcher on install, disable on
+	# remove. Both are best-effort and guarded against non-systemd hosts.
+	install -m 0755 debian/postinst $(DEB_STAGE)/DEBIAN/postinst
+	install -m 0755 debian/prerm    $(DEB_STAGE)/DEBIAN/prerm
 	mkdir -p dist
 	fakeroot dpkg-deb --build --root-owner-group $(DEB_STAGE) $(DEB_FILE)
 	@echo

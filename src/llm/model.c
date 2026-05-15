@@ -494,6 +494,32 @@ int model_pull(const char *target)
 		return -1;
 	}
 
+	/* First successful pull also becomes the preferred model. This is what
+	   wakes up `kora serve` — the systemd .path watcher and the launchd
+	   WatchPaths both fire on ~/.kora/preferred_model, bringing the daemon
+	   online without the user having to type anything. We never overwrite
+	   an existing preference: pulling a second model shouldn't silently
+	   change the default. */
+	char *existing_pref = kora_preferred_model();
+	if (!existing_pref) {
+		if (alias) {
+			kora_set_preferred_model(alias);
+		} else {
+			/* URL pull: store filename minus .gguf so the name matches
+			   the manual-entry form model_resolve_path() expects. */
+			char name_buf[256];
+			size_t nlen = strlen(filename);
+			if (nlen > 5 && strcmp(filename + nlen - 5, ".gguf") == 0)
+				nlen -= 5;
+			if (nlen >= sizeof name_buf)
+				nlen = sizeof name_buf - 1;
+			memcpy(name_buf, filename, nlen);
+			name_buf[nlen] = '\0';
+			kora_set_preferred_model(name_buf);
+		}
+	}
+	free(existing_pref);
+
 	if (!tui_mode)
 		printf("\ndone\n");
 	free(dest);

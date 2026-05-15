@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for kora preferred model
+Documentation=https://github.com/wrk-labs/kora
+
+[Path]
+PathExists=%h/.kora/preferred_model
+PathChanged=%h/.kora/preferred_model
+Unit=kora-serve.service
+
+[Install]
+WantedBy=default.target

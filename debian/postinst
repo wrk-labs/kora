@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Globally enable the path watcher so every user session picks it up on
+# next login. Guarded against non-systemd environments (build chroots,
+# minimal containers) so the package install never fails just because the
+# init system isn't around.
+if [ -d /run/systemd/system ]; then
+    systemctl --global enable kora-serve.path >/dev/null 2>&1 || true
+fi
+
+#DEBHELPER#

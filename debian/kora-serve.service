@@ -1,0 +1,9 @@
+[Unit]
+Description=Kora local inference server
+Documentation=https://github.com/wrk-labs/kora
+
+[Service]
+Type=simple
+ExecStart=__KORA_BIN__ serve
+Restart=on-failure
+RestartSec=5

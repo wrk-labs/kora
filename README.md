@@ -81,8 +81,24 @@ kora version          # print version
 
 Kora speaks the OpenAI chat-completions protocol internally: the TUI is a thin
 client that talks to a local `kora serve` daemon. In normal use you don't need
-to start the daemon yourself — if it isn't running, Kora tells you how. If you
-want it always-on, run it under systemd --user or equivalent.
+to start the daemon yourself — the package wires it up to a watcher that brings
+the server online the moment you pull your first model.
+
+### Auto-start on login
+
+**Linux.** The `.deb` ships a systemd user unit (`kora-serve.service`) and a
+companion path watcher (`kora-serve.path`). The path watcher is enabled
+globally at install time, so every user session has it running. The first
+time `kora pull` writes `~/.kora/preferred_model`, the watcher fires and
+the server comes up. Subsequent logins start it again automatically.
+
+**macOS.** The Homebrew formula ships a launchd agent. Start it once with
+`brew services start kora` — from then on it auto-loads across reboots and
+auto-restarts when you pull or switch models (via `WatchPaths`).
+
+In either case, if no model is configured yet, `kora serve` exits cleanly
+with a friendly message rather than crash-looping. Pull a model and the
+server picks it up without further intervention.
 
 ### Keyboard shortcuts
 
