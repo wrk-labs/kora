@@ -2,10 +2,13 @@
 set -e
 
 # Globally enable the path watcher so every user session picks it up on
-# next login. Guarded against non-systemd environments (build chroots,
-# minimal containers) so the package install never fails just because the
-# init system isn't around.
-if [ -d /run/systemd/system ]; then
+# next login. `systemctl --global enable` is a file-state operation
+# (writes symlinks under /etc/systemd/user/) and works fine inside a
+# chroot where systemd isn't running — the previous `[ -d /run/systemd/system ]`
+# guard was too strict and silently skipped the enable for any chroot
+# install (Debian installer, debootstrap, kai ISO build, etc.). Only
+# guard against systemctl missing entirely (very minimal containers).
+if command -v systemctl >/dev/null 2>&1; then
     systemctl --global enable kora-serve.path >/dev/null 2>&1 || true
 fi
 

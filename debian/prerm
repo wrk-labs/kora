@@ -1,7 +1,9 @@
 #!/bin/sh
 set -e
 
-if [ -d /run/systemd/system ]; then
+# Match postinst's guard — systemctl-presence, not systemd-running —
+# so removal in a chroot still cleans up the enable symlinks.
+if command -v systemctl >/dev/null 2>&1; then
     systemctl --global disable kora-serve.path >/dev/null 2>&1 || true
 fi
 
