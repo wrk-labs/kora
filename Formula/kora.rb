@@ -20,7 +20,6 @@ class Kora < Formula
     run [opt_bin/"kora", "serve"]
     run_at_load true
     keep_alive successful_exit: false
-    watch_paths ["#{ENV["HOME"]}/.kora/preferred_model"]
     log_path var/"log/kora.log"
     error_log_path var/"log/kora.log"
   end
